@@ -180,3 +180,34 @@ void ds41m_final(float* __restrict__ down_out, const int64_t* __restrict__ sel, 
         ((float4*) (o + c0))[t] = sum;
     }
 }
+
+// Uniform K=2.5: native WMMA accumulation, fused surrounding launches.
+template <bool CF32, bool TWO>
+__device__ __forceinline__ void k25_body(const half* A,const int64_t* sel,
+    const int64_t* T0,const int64_t* T1,void* C,int size_k,int size_n,int experts)
+{
+    const int slot=blockIdx.y, projection=TWO?blockIdx.z:0;
+    const int64_t e=sel[slot];
+    const size_t matrix=(size_t)projection*TOPK+slot;
+    void* out=CF32?static_cast<void*>(reinterpret_cast<float*>(C)+matrix*size_n)
+                   :static_cast<void*>(reinterpret_cast<half*>(C)+matrix*size_n);
+    const int64_t p=(e>=0 && e<experts)?(projection==0?T0:T1)[e]:0;
+    if(!p) {
+        const int col=blockIdx.x*32+threadIdx.x;
+        if(threadIdx.x<32 && col<size_n) {
+            if constexpr(CF32) reinterpret_cast<float*>(out)[col]=0.f;
+            else reinterpret_cast<half*>(out)[col]=__float2half_rn(0.f);
+        }
+        return;
+    }
+    exl3_gemv_kernel_body<2,CF32,2,1,0,true,true>(A+matrix*size_k,
+        reinterpret_cast<const uint16_t*>(p),out,1,size_k,size_n,nullptr,nullptr,nullptr,nullptr);
+}
+extern "C" __global__ __launch_bounds__(512)
+void ds41m_k25_gu(const half* A,const int64_t* sel,const int* unused,
+    const int64_t* T0,const int64_t* T1,void* C,int size_k,int size_n,int experts)
+{ k25_body<false,true>(A,sel,T0,T1,C,size_k,size_n,experts); }
+extern "C" __global__ __launch_bounds__(512)
+void ds41m_k25_down(const half* A,const int64_t* sel,const int* unused,
+    const int64_t* T0,const int64_t* T1,void* C,int size_k,int size_n,int experts)
+{ k25_body<true,false>(A,sel,T0,T1,C,size_k,size_n,experts); }

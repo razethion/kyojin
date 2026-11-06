@@ -348,13 +348,21 @@ class PrefetchRowStore(EngramRowStore):
     are the same ones, else reads synchronously. One reader thread (the underlying readers are not shared between
     threads); the reads release the GIL, so the model keeps computing the layers in front of the engram layer."""
 
-    def __init__(self, store: EngramRowStore, max_pending: int = 16):
+    def __init__(self, store: EngramRowStore, max_pending: int = 16, *, prepared_cpu: bool | None = None,
+                 prepared_max_bytes: int | None = None):
         from concurrent.futures import ThreadPoolExecutor
         self.store = store
         self.fmt = getattr(store, "fmt", "fp8")
-        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram-prefetch")
         self.pending = {}
-        self.max_pending = max_pending
+        self.max_pending = int(max_pending)
+        if self.max_pending < 1: raise ValueError('positive max_pending required')
+        self.prepared_cpu = (os.environ.get('DSV41_ENGRAM_PREPARED_CPU', '0') == '1'
+                             if prepared_cpu is None else bool(prepared_cpu))
+        self.prepared_max_bytes = (int(os.environ.get('DSV41_ENGRAM_PREPARED_MAX_BYTES', str(4 << 20)))
+                                   if prepared_max_bytes is None else int(prepared_max_bytes))
+        if self.prepared_max_bytes < 0: raise ValueError('nonnegative prepared byte bound required')
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram-prefetch")
+        self.prepared_hits = self.prepared_fallbacks = 0
         self.hits = self.misses = 0
 
     def num_rows(self, layer_pos):
@@ -362,28 +370,76 @@ class PrefetchRowStore(EngramRowStore):
 
     @staticmethod
     def _key(layer_pos, rows):
-        return layer_pos, rows.numel(), hash(rows.numpy().tobytes())
+        return layer_pos, rows.numel(), rows.numpy().tobytes()
+
+    def _read(self, layer_pos, rows):
+        raw = self.store.fetch(layer_pos, rows)
+        prepared = None
+        # Worst-case decoded FP32 expansion is <8x raw bytes for either
+        # supported format. Limit each entry before allocating decoded rows.
+        # Retained decoded payload <=max_pending*bound, plus at most one stale
+        # running job; the single worker bounds concurrent CPU dequant work.
+        if (self.prepared_cpu and raw.device.type == 'cpu' and
+                raw.numel() * raw.element_size() * 8 <= self.prepared_max_bytes):
+            try:
+                prepared = dequant_rows(raw, torch.float32, self.fmt)
+            except (RuntimeError, TypeError, AttributeError):
+                pass  # preserve canonical foreground fallback/error behavior
+        return raw, prepared
 
     def prefetch(self, layer_pos: int, rows: torch.Tensor):
-        rows = rows.detach().to("cpu", torch.int64).contiguous()
+        rows = rows.detach().to("cpu", torch.int64).contiguous().clone()
         k = self._key(layer_pos, rows)
         if k in self.pending:
             return
         while len(self.pending) >= self.max_pending:                  # stale entries (rows nobody fetched)
             self.pending.pop(next(iter(self.pending))).cancel()
-        self.pending[k] = self.pool.submit(self.store.fetch, layer_pos, rows)
+        self.pending[k] = self.pool.submit(self._read, layer_pos, rows)
+
+    def prefetch_plan(self, plan):
+        if plan.key in self.pending:
+            return
+        while len(self.pending) >= self.max_pending:
+            self.pending.pop(next(iter(self.pending))).cancel()
+        self.pending[plan.key] = self.pool.submit(self._read, plan.key[0], plan.rows)
+
+    def fetch_plan(self, plan, dtype):
+        fut = self.pending.pop(plan.key, None)
+        if fut is None:
+            self.misses += 1
+            fut = self.pool.submit(self._read, plan.key[0], plan.rows)
+        else:
+            self.hits += 1
+        raw, prepared = fut.result()
+        if prepared is not None:
+            self.prepared_hits += 1
+            return prepared.to(dtype)
+        self.prepared_fallbacks += 1
+        return dequant_rows(raw, dtype, self.fmt)
 
     def fetch(self, layer_pos, rows):
+        return self._take(layer_pos, rows)[0]
+
+    def _take(self, layer_pos, rows):
         r = rows.detach().to("cpu", torch.int64).contiguous()
         fut = self.pending.pop(self._key(layer_pos, r), None)
         if fut is not None:
             self.hits += 1
             return fut.result()
         self.misses += 1
-        return self.pool.submit(self.store.fetch, layer_pos, r).result()     # same thread as the prefetches
+        return self.pool.submit(self._read, layer_pos, r).result()     # same thread as the prefetches
+
+    def fetch_dequant(self, layer_pos, rows, dtype):
+        raw, prepared = self._take(layer_pos, rows)
+        if prepared is not None:
+            self.prepared_hits += 1
+            return prepared.to(dtype)
+        self.prepared_fallbacks += 1
+        return dequant_rows(raw, dtype, self.fmt)
 
     def close(self):
         self.pool.shutdown(wait=True)
+        self.pending.clear()
         getattr(self.store, "close", lambda: None)()
 
 
@@ -449,16 +505,55 @@ class RawBinEngramStore(FileEngramStore):
         return cls(readers, rows, fmt)
 
 
+@dataclass(frozen=True)
+class EngramLookupPlan:
+    """Ephemeral one-position row mapping; never retained in model/cache state."""
+    rows: torch.Tensor
+    inverse: torch.Tensor
+    shape: tuple
+    key: tuple
+
+    @classmethod
+    def build(cls, hash_ids, layer_pos, *, layout=None):
+        if hash_ids.dtype != torch.int64 or hash_ids.ndim != 3:
+            raise ValueError("int64 [B,L,columns] hashes required")
+        cpu = hash_ids.detach().to("cpu", torch.int64).contiguous().clone()
+        flat = cpu.reshape(-1)
+        canonical = False
+        if layout is not None and cpu.shape[:2] == (1, 1):
+            offsets = torch.as_tensor(layout.offsets(layer_pos), dtype=torch.int64)
+            sizes = torch.tensor([p for ng in layout.primes[layer_pos] for p in ng])
+            canonical = (flat.numel() == offsets.numel() and
+                         bool(((flat >= offsets) & (flat < offsets + sizes)).all()))
+        if canonical:
+            # Disjoint increasing column ranges imply already sorted, unique IDs.
+            rows, inverse = flat, torch.arange(flat.numel(), dtype=torch.int64)
+        else:
+            rows, inverse = torch.unique(flat, return_inverse=True)
+        rows = rows.contiguous()
+        return cls(rows, inverse.to(hash_ids.device), tuple(cpu.shape),
+                   PrefetchRowStore._key(layer_pos, rows))
+
+
 # -------------------------------------------------------------------------------------- forward
 def engram_inject(h: torch.Tensor, hash_ids: torch.Tensor, store: EngramRowStore, layer_pos: int, wkv,
                   qk_weight: torch.Tensor, hc: int, dim: int, eps: float, token_mask=None,
-                  clamp_value: float = 1e-6) -> torch.Tensor:
+                  clamp_value: float = 1e-6, lookup_plan: EngramLookupPlan | None = None) -> torch.Tensor:
     """h [B,L,hc,dim] (residual streams) + hashes [B,L,n_cols] -> updated streams (model.py:350).
     wkv: callable [.., n_cols*256] -> [.., dim*(hc+1)] ; qk_weight = q_weight*k_weight [hc, dim]."""
     B, L, nc = hash_ids.shape
-    flat = hash_ids.reshape(-1)
-    uniq, inv = torch.unique(flat, return_inverse=True)
-    rows = dequant_rows(store.fetch(layer_pos, uniq), h.dtype, getattr(store, "fmt", "fp8")).to(h.device)
+    if lookup_plan is None:
+        flat = hash_ids.reshape(-1)
+        uniq, inv = torch.unique(flat, return_inverse=True)
+    else:
+        if lookup_plan.shape != tuple(hash_ids.shape) or lookup_plan.key[0] != layer_pos:
+            raise ValueError("lookup plan geometry/layer differs")
+        uniq, inv = lookup_plan.rows, lookup_plan.inverse
+    if isinstance(store, PrefetchRowStore):
+        rows = (store.fetch_plan(lookup_plan, h.dtype) if lookup_plan is not None else
+                store.fetch_dequant(layer_pos, uniq, h.dtype)).to(h.device)
+    else:
+        rows = dequant_rows(store.fetch(layer_pos, uniq), h.dtype, getattr(store, "fmt", "fp8")).to(h.device)
     emb = rows[inv].view(B, L, nc, rows.size(-1))
     kv = wkv(emb.flatten(-2))
     key, value = kv.split([hc * dim, dim], dim=-1)

@@ -31,9 +31,13 @@ PAGE_ROWS = 256
 class PagedPool:
     """Growable row pool [B, capacity, width]; capacity is a multiple of `page` and never above `max_rows`."""
 
-    def __init__(self, batch: int, width: int, dtype, device, max_rows: int, page: int = PAGE_ROWS, fill: float = 0.0):
+    def __init__(self, batch: int, width: int, dtype, device, max_rows: int, page: int = PAGE_ROWS, fill: float = 0.0,
+                 growth: str | None = None):
         self.batch, self.width, self.dtype, self.device = batch, width, dtype, device
         self.max_rows, self.page, self.fill = max(int(max_rows), 1), page, fill
+        self.growth = growth or os.environ.get("DSV41_POOL_GROWTH", "linear")
+        if self.page <= 0 or self.growth not in ("linear", "geometric"):
+            raise ValueError("positive page and linear/geometric growth required")
         self.t = torch.full((batch, 0, width), fill, dtype=dtype, device=device)
 
     @property
@@ -45,6 +49,8 @@ class PagedPool:
         rows = min(int(rows), self.max_rows)
         if rows > self.capacity:
             cap = min(-(-rows // self.page) * self.page, self.max_rows)
+            if self.growth == "geometric":
+                cap = min(self.max_rows, max(cap, self.capacity * 2))
             t = torch.full((self.batch, cap, self.width), self.fill, dtype=self.dtype, device=self.device)
             t[:, :self.capacity] = self.t
             self.t = t
@@ -77,7 +83,8 @@ class DSV41Cache(DSV41State):
         self.idx_kq, self.idx_ks = {}, {}
         self.comp_kv_state, self.comp_score_state = {}, {}
         for l in cfg.kv_source_layer_ids:
-            if l >= n:
+            first, last = getattr(model, 'layer_span', (0, n))
+            if not first <= l < last:
                 continue
             r = cfg.ratio(l)
             rows = max_seq // r
@@ -129,8 +136,9 @@ class DSV41Cache(DSV41State):
         for l in self._kv:
             self._kv[l].t.zero_()
             self._ik[l].t.zero_()
-            self._iq[l].t.zero_()
-            self._is[l].t.zero_()
+            if self.packed:
+                self._iq[l].t.zero_()
+                self._is[l].t.zero_()
         for l in self.comp_kv_state:
             self.comp_kv_state[l].zero_()
             self.comp_score_state[l].fill_(-torch.inf)
@@ -158,7 +166,7 @@ class DSV41Cache(DSV41State):
         c._kv, c._ik, c._iq, c._is = {}, {}, {}, {}
         for src, dst in ((self._kv, c._kv), (self._ik, c._ik), (self._iq, c._iq), (self._is, c._is)):
             for l, p in src.items():
-                q = PagedPool(p.batch, p.width, p.dtype, p.device, p.max_rows, p.page, p.fill)
+                q = PagedPool(p.batch, p.width, p.dtype, p.device, p.max_rows, p.page, p.fill, p.growth)
                 q.t = p.t.clone()
                 dst[l] = q
         c.comp_kv = {l: p.t for l, p in c._kv.items()}

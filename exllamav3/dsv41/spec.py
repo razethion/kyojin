@@ -23,6 +23,7 @@ Both share one `DSV41State` (the stage rings are layers n..n+2 of the same state
 The returned objects are duck-typed to dspark.TargetOut / dspark.DraftOut (logits, hidden / tokens, q).
 """
 from __future__ import annotations
+import os
 from dataclasses import dataclass
 from typing import Any, Sequence
 import torch
@@ -154,9 +155,9 @@ class PortDrafter:
         self.holes = 0                      # positions the window never saw (lowers acceptance, never correctness)
         self._next = 0                      # first position not yet fed
 
-    supports_want = True                # draft(want=k): chain passes only up to k tokens (the first pass is free of it)
+    supports_want = True                # draft(want=k): chain passes only up to k tokens
 
-    def draft(self, token: int, hidden, start_pos: int, want: int | None = None) -> DraftTokens:
+    def draft(self, token: int, hidden, start_pos: int, want: int | None = None, *, want_conf: bool = True) -> DraftTokens:
         s = self.s
         limit = self.max_depth if want is None else max(1, min(int(want), self.max_depth))
         heads = s.model.mtp
@@ -171,9 +172,14 @@ class PortDrafter:
         if n > 1:
             heads.feed(hidden[None, : n - 1], first, s.st)
         last = hidden[n - 1][None, None]
-        ids, _logits, conf = heads.forward_spec(torch.tensor([token]), last, start_pos, s.st)
+        partial = want is not None and os.environ.get("DSV41_DRAFT_PARTIAL_HEAD", "0") == "1"
+        skip_conf = not want_conf and os.environ.get("DSV41_DRAFT_SKIP_CONF", "0") == "1"
+        head_args = {"n_proposals": min(limit, self.blk)} if partial else {}
+        if skip_conf:
+            head_args["want_conf"] = False
+        ids, _logits, conf = heads.forward_spec(torch.tensor([token]), last, start_pos, s.st, **head_args)
         self._next = start_pos + 1
-        toks, confs = ids[0, 1:], conf[0]
+        toks, confs = ids[0, 1:], None if conf is None else conf[0]
         sp = start_pos
         while toks.numel() < limit:                            # chained pass: anchor = last drafted token
             sp += self.blk
@@ -181,10 +187,16 @@ class PortDrafter:
             slot = sp % cfg.sliding_window
             n0 = cfg.num_hidden_layers
             saved = [s.st.win[n0 + j][:, slot].clone() for j in range(heads.n_stages)]
-            ids2, _l2, conf2 = heads.forward_spec(toks[-1:].clone(), last, sp, s.st)
+            head_args = {"n_proposals": min(limit - toks.numel(), self.blk)} if partial else {}
+            if skip_conf:
+                head_args["want_conf"] = False
+            ids2, _l2, conf2 = heads.forward_spec(toks[-1:].clone(), last, sp, s.st, **head_args)
             for j, v in enumerate(saved):
                 s.st.win[n0 + j][:, slot] = v
             toks = torch.cat([toks, ids2[0, 1:]])
-            confs = torch.cat([confs, conf2[0]])
-        toks, confs = toks[: limit], confs[: limit]
+            if confs is not None:
+                confs = torch.cat([confs, conf2[0]])
+        toks = toks[:limit]
+        if confs is not None:
+            confs = confs[:limit]
         return DraftTokens(toks.tolist(), conf=confs)           # conf stays a tensor: read only when a threshold is set

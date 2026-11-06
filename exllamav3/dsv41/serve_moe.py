@@ -94,7 +94,9 @@ class GroupedMoE:
         # K=4 experts run the WMMA body in the per-group path (k-split follows EXL3_MOE_CFG); the unified kernel is the VALU
         # matvec (k-split 16, = CFG 0), so K=4 joins it only when the two are bit-identical
         ks_ok = (1.0, 2.0, 3.0, 4.0) if os.environ.get("EXL3_MOE_CFG", "0") in ("", "0") else (1.0, 2.0, 3.0)
-        if self.decode_ok and self.store.num_groups <= 3 and all(g.k_gu in ks_ok for g in self.store.groups):
+        half25 = (os.environ.get('DSV41_UNIFIED_K25','0')=='1' and
+                  self.store.num_groups==1 and self.store.groups[0].k_gu==2.5)
+        if self.decode_ok and self.store.num_groups <= 3 and (half25 or all(g.k_gu in ks_ok for g in self.store.groups)):
             from ..modules.dsv41_fn import dsv41_moe as UM
             if UM.available(self.device):
                 self.uni = UM.UnifiedMoE(self.store, self.buffers, self.outputs[:self.store.num_groups], self.H, self.I,

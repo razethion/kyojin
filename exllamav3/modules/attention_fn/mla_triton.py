@@ -649,15 +649,16 @@ def _mla_absorb_kernel(
     offs_k = tl.arange(0, NOPE_PAD)
     valid_k = offs_k < D_nope
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_n = offs_n < D_c
 
     q_t = tl.load(q + offs_m[:, None] * Q_STRIDE + head * QK_DIM + offs_k[None, :],
                   mask = valid_m[:, None] & valid_k[None, :], other = 0.0)
     # W_UK_h^T columns live at flat[:, head*D_nope : (head+1)*D_nope]; the dot wants (K, N)
     w_t = tl.load(w_uk_flat + offs_n[:, None] * (n_q_heads * D_nope) + head * D_nope + offs_k[None, :],
-                  mask = valid_k[None, :], other = 0.0)
+                  mask = valid_n[:, None] & valid_k[None, :], other = 0.0)
     acc = tl.dot(q_t, tl.trans(w_t))
     tl.store(out + (head * R + offs_m[:, None]) * D_c + offs_n[None, :],
-             acc.to(tl.float16), mask = valid_m[:, None])
+             acc.to(tl.float16), mask = valid_m[:, None] & valid_n[None, :])
 
 
 @triton.jit(do_not_specialize = ["R"])
@@ -738,20 +739,22 @@ def _mla_unfold_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     valid_m = offs_m < R
     offs_v = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_v = offs_v < D_v
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for k0 in range(0, D_c, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         o_t = tl.load(o_lat + (head * R + offs_m[:, None]) * D_c + offs_k[None, :],
-                      mask = valid_m[:, None], other = 0.0)
-        w_t = tl.load(w_uv_flat + offs_k[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :])
+                      mask = valid_m[:, None] & (offs_k < D_c)[None, :], other = 0.0)
+        w_t = tl.load(w_uv_flat + offs_k[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :],
+                      mask = (offs_k < D_c)[:, None] & valid_v[None, :], other = 0.0)
         acc = tl.dot(o_t, w_t, acc = acc)
     if OUT_PITCH:
         tl.store(out + offs_m[:, None] * OUT_PITCH + head * D_v + offs_v[None, :],
-                 acc.to(tl.float16), mask = valid_m[:, None])
+                 acc.to(tl.float16), mask = valid_m[:, None] & valid_v[None, :])
     else:
         tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
-                 acc.to(tl.float16), mask = valid_m[:, None])
+                 acc.to(tl.float16), mask = valid_m[:, None] & valid_v[None, :])
 
 
 @triton.jit
@@ -1408,7 +1411,7 @@ def mla_absorb(q: torch.Tensor, w_uk_flat: torch.Tensor, n_q_heads: int, qk_nope
                 block_m = min(64, triton.next_power_of_2(max(R, 16)))
                 bn, nw, ns = 128, 4, 2
     with torch.cuda.device(q.device):
-        _mla_absorb_kernel[(triton.cdiv(R, block_m), D_c // bn, H)](
+        _mla_absorb_kernel[(triton.cdiv(R, block_m), triton.cdiv(D_c, bn), H)](
             q, w_uk_flat, out, R,
             H, qk_dim, H * qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim), D_c,
             block_m, bn,

@@ -34,6 +34,7 @@ class PackLin(Lin):
         self.lin = lin
         self.in_features, self.out_features = lin.in_features_unpadded, lin.out_features_unpadded
         self._wt = None
+        self.verify_fuse = os.environ.get('DSV41_VERIFY_FUSE', '0') == '1'
 
     def _dense_t(self, inner):
         if self._wt is None:                                  # CPU float path: [out, in] fp32, built once
@@ -58,7 +59,8 @@ class PackLin(Lin):
             if type(inner).__name__ == "CpuLinearEXL3":           # CPU: float activations, like the fp16 path above
                 y = inner.forward(xp.float().reshape(-1, xp.shape[-1]), {}, torch.float32).reshape(*lead, -1)
             else:
-                y = inner.forward(xp.half().reshape(-1, xp.shape[-1]).contiguous(), {}, torch.half).reshape(*lead, -1)
+                y = inner.forward(xp.half().reshape(-1, xp.shape[-1]).contiguous(),
+                                  {'dflash_verify': self.verify_fuse}, torch.half).reshape(*lead, -1)
         if y.shape[-1] != lin.out_features_unpadded:
             y = y[..., :lin.out_features_unpadded]
         return y.to(x.dtype).contiguous()
@@ -154,7 +156,7 @@ def subset_config(dcfg: DSV41Config, layers: int = None, mtp: bool = True) -> DS
 
 
 def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = None, mtp: bool = True,
-         moe: str = "auto", prefill_chunk: int = 2048, engram_store=None, log=None, **kw):
+         moe: str = "auto", prefill_chunk: int = 2048, engram_store=None, log=None, layer_span=None, **kw):
     """Load the pack in `model_dir` into a `DSV41Serving` on `device`.
 
     layers  only the first N trunk layers (+ embed / final norm / head): the smoke test of a real pack on one layer
@@ -173,6 +175,14 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
     full = cfg.dsv41
     dcfg = subset_config(full, layers, mtp and cfg.dsv41_n_mtp > 0)
     n_load = dcfg.num_hidden_layers
+    first, last = (0, n_load) if layer_span is None else tuple(layer_span)
+    if not (0 <= first < last <= n_load):
+        raise ValueError("invalid serving layer span")
+    # Sharing starts at source layers. A stage must never read an unowned pool.
+    if first and (first not in full.kv_source_layer_ids or first not in full.index_source_layer_ids):
+        raise ValueError("partition must start at a KV and index source")
+    if last < n_load and dcfg.n_mtp_layers:
+        raise ValueError("DSpark belongs to the final stage only")
     qcfg = cfg.config_dict.get("quantization_config") or {}
 
     text = Model.from_config(cfg)
@@ -180,7 +190,7 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
     blocks = []
     for mod in text.modules:
         key = mod.key
-        if key.startswith("layers.") and int(key.split(".")[1]) >= n_load:
+        if key.startswith("layers.") and not first <= int(key.split(".")[1]) < last:
             continue
         mod.load(dev)
         log(f"loaded {key}")
@@ -205,7 +215,7 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
                 src.add_block(mod)
 
     store = tm = mult = None
-    if dcfg.engram_layer_ids:
+    if any(first <= l < last for l in dcfg.engram_layer_ids):
         eg = cfg.engram_runtime()
         tm, mult = eg["token_map"], eg["multipliers"]
         if not dcfg.engram_compressed_vocab_size:
@@ -219,7 +229,8 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
         if moe == "loop" or not grouped_available(dev):
             raise RuntimeError("EXL3_EXPERT_BUDGET_GIB needs the grouped MoE kernels (moe=auto on a GPU with the extension)")
     model = DSV41Serving(dcfg, src, None, store, token_map=tm, multipliers=mult, dtype=dtype, device=dev,
-                         prefill_chunk=prefill_chunk, ablit_dir=kw.pop("ablit_dir", cfg.directory), **kw)
+                         prefill_chunk=prefill_chunk, ablit_dir=kw.pop("ablit_dir", cfg.directory),
+                         layer_span=(first, last), **kw)
     model.pack_modules = (text, mtp_mod)                      # keep the module trees (and their tensors) alive
     if moe != "loop" and grouped_available(dev):
         for b in blocks + [m for m in (mtp_mod.modules if mtp_mod else []) if m.key != "mtp.extra"]:

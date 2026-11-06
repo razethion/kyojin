@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from .config import DSV41Config
 from . import ops, quant
 from .model import DSV41Model, SharedRt, _LW
-from .engram import EngramLayout, engram_inject, MemoryEngramStore, PrefetchRowStore
+from .engram import EngramLayout, engram_inject, MemoryEngramStore, PrefetchRowStore, EngramLookupPlan
 from .experts import SourceExpertProvider
 from .serve_cache import DSV41Cache
 from .vision import span_mask, splice
@@ -45,19 +45,23 @@ class DSV41Serving(DSV41Model):
     def __init__(self, cfg: DSV41Config, source, provider=None, engram_store=None, token_map=None, multipliers=None,
                  primes=None, dtype=torch.float16, device="cpu", moe_backends: dict = None, hc=None,
                  prefill_chunk: int = 2048, attn_block: int = 128, index_block_bytes: int = 256 << 20,
-                 engram_prefetch: bool = True, ablit_dir: str = None):
+                 engram_prefetch: bool = True, ablit_dir: str = None, layer_span=None):
         from .model import DSV41Graph
         DSV41Graph.__init__(self, cfg.validate(), dtype, device)
         self.src = source
         # row reads overlap with compute: the rows of a pass are known at its start (PrefetchRowStore)
-        if engram_store is not None and engram_prefetch and not isinstance(engram_store, (MemoryEngramStore, PrefetchRowStore)):
+        if engram_store is not None and engram_prefetch and not isinstance(engram_store, (MemoryEngramStore, PrefetchRowStore, EngramLookupPlan)):
             engram_store = PrefetchRowStore(engram_store)
         self.engram_store = engram_store
         self.token_map, self.multipliers = token_map, multipliers
         self.compressed_vocab = cfg.engram_compressed_vocab_size
         self.engram_layout = None
         n = cfg.num_hidden_layers
-        if cfg.engram_layer_ids:
+        self.layer_span = (0, n) if layer_span is None else tuple(layer_span)
+        first, last = self.layer_span
+        if not 0 <= first < last <= n:
+            raise ValueError("invalid serving layer span")
+        if cfg.engram_layer_ids and any(first <= l < last for l in cfg.engram_layer_ids):
             assert token_map is not None, "engram needs the compressed token map"
             if not self.compressed_vocab:
                 self.compressed_vocab = int(max(token_map)) + 1
@@ -79,7 +83,7 @@ class DSV41Serving(DSV41Model):
         self.idx_score_bytes = ev("DSV41_PF_IDX_SCORE_MB", 1024) << 20 if os.environ.get("DSV41_PF_IDX_SCORE_MB", "1024") != "0" else 1 << 62
         self.packed_idx = os.environ.get("DSV41_IDX_PACKED", "0") == "1"
         self.lw = {}
-        for l in range(n + cfg.n_mtp_layers):
+        for l in list(range(first, last)) + list(range(n, n + cfg.n_mtp_layers)):
             self.lw[l] = self._load_layer(l)
         self._rope = {}
         self._rope32 = {}
@@ -195,7 +199,8 @@ class DSV41Serving(DSV41Model):
         cfg, c = self.cfg, self.lw[l].comp
         B, L, _ = x.shape
         r = cfg.ratio(l)
-        fast = self._dec_fast(B, L, start_pos) and st.journal is None
+        fast = self._dec_fast(B, L, start_pos) and (st.journal is None or
+                os.environ.get('DSV41_VERIFY_ATTENTION', '0') == '1')
         if r == 1:
             if fast:
                 from ..modules.dsv41_fn import dsv41_hip as K
@@ -210,6 +215,8 @@ class DSV41Serving(DSV41Model):
         if fast and r <= 8:
             from ..modules.dsv41_fn import dsv41_hip as K
             ng = (start_pos + 1) // r - start_pos // r
+            if st.journal is not None:
+                st._jr_comp(l, start_pos, start_pos % r, B)
             out = torch.empty(1, 1, kv.size(-1), dtype=torch.float16, device=x.device) if ng else kv.new_empty(0).half()
             K.compress(kv.view(1, -1), score.view(1, -1), kst[0], sst[0], c.norm, out.view(-1, kv.size(-1)) if ng else out,
                        start_pos, r, cfg.rms_norm_eps)
@@ -359,6 +366,8 @@ class DSV41Serving(DSV41Model):
             pinned.scatter_(1, li, torch.where((last >= 0).unsqueeze(1), torch.inf, sc.gather(1, li)))
             top = pinned.topk(min(cfg.candidate_topk_blocks, nb), dim=-1)
             rt.cand_blocks = torch.where(top.values > -torch.inf, top.indices, -1).int().contiguous()
+            if os.environ.get("DSV41_CANONICAL_CANDIDATE_ORDER", "0") == "1":
+                rt.cand_blocks = self._canonical_candidate_blocks(rt.cand_blocks)
         if sc is not None and L > 1 and nb >= 8192 and topk <= nb:
             # exact two-stage selection: every top-k key sits in one of the k blocks with the best block maximum
             blocks = sc.topk(topk, dim=-1, sorted=False).indices
@@ -393,6 +402,22 @@ class DSV41Serving(DSV41Model):
         K.rmsnorm_rows(x.view(-1, x.size(-1)), w, y.view(-1, x.size(-1)), self.cfg.rms_norm_eps)
         return y
 
+    @staticmethod
+    def _canonical_candidate_blocks(blocks):
+        """Pure permutation of selected IDs; masks last, valid IDs ascending."""
+        sentinel = torch.iinfo(blocks.dtype).max
+        ordered = torch.where(blocks >= 0, blocks, sentinel).sort(dim=-1).values
+        return torch.where(ordered == sentinel, -1, ordered).contiguous()
+
+    @staticmethod
+    def _sparse_prefill(q, kv, sink, idx, scale, kv_pool):
+        """Optional concatenated storage control, with identical logical key order."""
+        if os.environ.get("DSV41_PF_DUAL_POOL", "1") == "0":
+            if kv_pool is not None and kv_pool.size(1):
+                kv = torch.cat((kv, kv_pool), dim=1)
+            kv_pool = None
+        return _pf.sparse_attention(q, kv, sink, idx, scale, kv_pool)
+
     def _pfrope(self, fast, x, fc_rows, pos_fn, heads, inverse=False):
         """Rope of the last rope_head_dim dims of x [1, rows, (heads,) 512]; fc_rows: the complex table rows of its positions;
         pos_fn() -> (fc32 table, int32 positions) for the kernel path."""
@@ -409,7 +434,7 @@ class DSV41Serving(DSV41Model):
             t[k] = (fc_t, K.rope_table_f32(fc_t))      # keep fc_t alive: the id stays unique
         return t[k][1]
 
-    def _attention(self, l, x, start_pos, st, rt, taps=None):
+    def _attention(self, l, x, start_pos, st, rt, taps=None, projected=None, raw_output=False):
         cfg, w = self.cfg, self.lw[l]
         B, L, _ = x.shape
         pf = self._pffast(x)
@@ -424,16 +449,19 @@ class DSV41Serving(DSV41Model):
             return self._pftab(fc_t), torch.arange(start_pos, start_pos + L, dtype=torch.int32, device=x.device)
         if fast:
             from ..modules.dsv41_fn import dsv41_hip as K
-            qk = dec2.pair(w, "QKV", (w.wq_a, w.wkv), x.view(1, -1)) if x.dtype == torch.half else None
-            if qk is not None:
-                qr, kvr = qk[0].view(1, 1, -1), qk[1].view(1, 1, -1)
+            if projected is not None:
+                qr, q, kvr = projected
             else:
-                qr = w.wq_a(x)
-                kvr = None
-            K.rmsnorm_rows(qr.view(1, -1), w.q_norm, qr.view(1, -1), cfg.rms_norm_eps)
-            q = w.wq_b(qr)
-            if kvr is None:
-                kvr = w.wkv(x)
+                qk = dec2.pair(w, "QKV", (w.wq_a, w.wkv), x.view(1, -1)) if x.dtype == torch.half else None
+                if qk is not None:
+                    qr, kvr = qk[0].view(1, 1, -1), qk[1].view(1, 1, -1)
+                else:
+                    qr = w.wq_a(x)
+                    kvr = None
+                K.rmsnorm_rows(qr.view(1, -1), w.q_norm, qr.view(1, -1), cfg.rms_norm_eps)
+                q = w.wq_b(qr)
+                if kvr is None:
+                    kvr = w.wkv(x)
             if st.journal is not None:
                 st._jr_ring(l, [start_pos], B)
             K.kv_prep(kvr.view(1, hd), w.kv_norm, self._rope_f32(ratio, st.max_seq), self._pos32, self._slot32, None,
@@ -518,13 +546,12 @@ class DSV41Serving(DSV41Model):
         elif q is None:
             # long prompt chunk: q, the attention output and the grouped output projection run on row blocks (rows are
             # independent: the same arithmetic as the whole chunk at once, without its two [L, 32768] fp16 buffers)
-            kvc = kv_all if kv_pool is None or kv_pool.size(1) == 0 else torch.cat([kv_all, kv_pool], dim=1)
             ys = []
             for a, b in self._row_blocks(L, self.pf_attn_rows):
                 pos = lambda: (self._pftab(fc_t), torch.arange(start_pos + a, start_pos + b, dtype=torch.int32, device=x.device))
                 qb = w.wq_b(qr[:, a:b]).unflatten(-1, (H, hd))
                 self._pfrope(pf, qb, fc[a:b], pos, H)
-                ob = _pf.sparse_attention(qb, kvc, w.sink, idxs[:, a:b], sc)
+                ob = self._sparse_prefill(qb, kv_all, w.sink, idxs[:, a:b], sc, kv_pool)
                 del qb
                 self._pfrope(pf, ob, fc[a:b], pos, H, True)
                 ob = ob.view(B, b - a, G, -1)
@@ -534,8 +561,7 @@ class DSV41Serving(DSV41Model):
             return ys[0] if len(ys) == 1 else torch.cat(ys, dim=1)
         else:
             if L >= PF_ATTN_MIN_ROWS and _pf.usable(q, kv_all, idxs, w.sink):
-                kvc = kv_all if kv_pool is None or kv_pool.size(1) == 0 else torch.cat([kv_all, kv_pool], dim=1)
-                o = _pf.sparse_attention(q, kvc, w.sink, idxs, sc)      # WMMA kernel: prompt chunks only (not verify blocks)
+                o = self._sparse_prefill(q, kv_all, w.sink, idxs, sc, kv_pool)      # WMMA kernel: prompt chunks only (not verify blocks)
             else:
                 o = torch.empty_like(q)
                 for a in range(0, L, self.attn_block):
@@ -544,16 +570,46 @@ class DSV41Serving(DSV41Model):
             self._pfrope(pf, o, fc, qpos, H, True)
             o = o.view(B, L, G, -1)
             quant.act_quant_fp8_(o, cfg.fp8_block_size)
+        if raw_output:
+            return o
         o = self._wo_a(w, o)
         return w.wo_b(o.flatten(2))
 
-    def _engram_rows(self, hh, hashes, e, keep):
+    def _attention_verify(self, l, x, start_pos, st, runtimes, taps=None, row_positions=None):
+        """Batched projections, decode-identical positional attention and journals.
+
+        The decode HIP attention includes fake quantization and has a different
+        reduction order from the generic block path. Keep that exact kernel per
+        row while sharing the expensive matrix reads across the verify block.
+        Each row carries its own shared-source/index selection across layers.
+        """
+        w = self.lw[l]
+        qr = self._pfrms(True, w.wq_a(x), w.q_norm)
+        q, kv = w.wq_b(qr), w.wkv(x)
+        outputs = []
+        for i in range(x.size(1)):
+            if row_positions is None:
+                self._pos32 = torch.tensor([start_pos+i],dtype=torch.int32,device=self.device)
+                self._slot32 = self._pos32 % self.cfg.sliding_window
+            else:
+                self._pos32, self._slot32 = row_positions[i]
+            outputs.append(self._attention(l,x[:,i:i+1],start_pos+i,st,runtimes[i],taps,
+                projected=(qr[:,i:i+1].contiguous(),q[:,i:i+1].contiguous(),kv[:,i:i+1].contiguous()),raw_output=True))
+        o = torch.cat(outputs,dim=1)
+        return w.wo_b(self._wo_a(w,o).flatten(2))
+
+    def _engram_rows(self, hh, hashes, e, keep, lookup_plans=None):
         """engram_inject on row blocks, written back in place (rows are independent): its gather / projection temporaries
         are ~450 KiB per row, so a 64K chunk would need ~30 GiB at once."""
         cfg, L = self.cfg, hh.size(1)
+        if 1 < L <= 8 and os.environ.get('DSV41_VERIFY_ENGRAM', '0') == '1':
+            return torch.cat([engram_inject(hh[:,i:i+1], hashes[:,i:i+1], self.engram_store,
+                e.pos, e.wkv, e.qk, cfg.hc_mult, cfg.hidden_size, cfg.rms_norm_eps,
+                token_mask=None if keep is None else keep[:,i:i+1],
+                lookup_plan=None if lookup_plans is None else lookup_plans[i]) for i in range(L)], dim=1)
         if L <= self.pf_eng_rows or hh.dtype != torch.float32 or not hh.is_contiguous():
             return engram_inject(hh, hashes, self.engram_store, e.pos, e.wkv, e.qk, cfg.hc_mult, cfg.hidden_size,
-                                 cfg.rms_norm_eps, token_mask=keep)
+                                 cfg.rms_norm_eps, token_mask=keep, lookup_plan=None if lookup_plans is None else lookup_plans[0])
         for a, b in self._row_blocks(L, self.pf_eng_rows):
             hh[:, a:b] = engram_inject(hh[:, a:b], hashes[:, a:b], self.engram_store, e.pos, e.wkv, e.qk, cfg.hc_mult,
                                        cfg.hidden_size, cfg.rms_norm_eps,
@@ -599,8 +655,12 @@ class DSV41Serving(DSV41Model):
                     sh = w.shared.ffn(x, None, cfg.swiglu_limit)
                     sd.sh_done.record(sd.stream)
             wts, wh, idx, gsel = self.router.fused(x, w.gate_w, w.gate_b, w.topk, be.store.lut)
+            # Canonicalize from the rounded FP32 weights, just like batched verification.
+            # The fused conversion can disagree at a half-way value on gfx1151.
+            wh = wts.half().contiguous()
             if taps is not None:
                 taps[f"L{l}.route.idx"], taps[f"L{l}.route.w"] = idx.clone(), wts.clone()
+                taps[f"L{l}.route.wh"] = wh.clone()
             be.prepare(idx)
             outs = be.decode_parts(x, idx, wh, gsel)
             if sd is not None:
@@ -609,6 +669,11 @@ class DSV41Serving(DSV41Model):
                 sh.record_stream(cur)
             else:
                 sh = w.shared.ffn(x, None, cfg.swiglu_limit)
+            if taps is not None:
+                yr = outs[0].clone()
+                for o in outs[1:]: yr.add_(o)
+                taps[f"L{l}.ffn_shared"] = sh.clone()
+                taps[f"L{l}.ffn_routed"] = yr
             if sh.dtype == torch.half and sh.is_contiguous():
                 from ..modules.dsv41_fn import dsv41_fuse as FZ
                 return FZ.moe_tail(outs, sh).view(shape)
@@ -619,6 +684,7 @@ class DSV41Serving(DSV41Model):
         wts, idx = self.router(x, w.gate_w, self._route_bias(w), w.topk)
         if taps is not None:
             taps[f"L{l}.route.idx"], taps[f"L{l}.route.w"] = idx.clone(), wts.clone()
+            taps[f"L{l}.route.wh"] = wts.half().clone()
         if isinstance(be, GroupedMoE):
             be.prepare(idx)
         T = x.size(0)
@@ -633,7 +699,19 @@ class DSV41Serving(DSV41Model):
                 del yb
             return out.view(shape)
         y = be.run(l, x, wts.float(), idx, w.n_exp)
-        y = y + w.shared.ffn(x, None, cfg.swiglu_limit).float()
+        sh = w.shared.ffn(x, None, cfg.swiglu_limit)
+        if taps is not None:
+            taps[f"L{l}.ffn_shared"] = sh.clone()
+            taps[f"L{l}.ffn_routed"] = y.clone()
+        if (os.environ.get('DSV41_VERIFY_MOE_TAIL', '0') == '1' and self.fuse
+                and isinstance(be, GroupedMoE) and 2 <= T <= 8
+                and x.dtype == torch.half and y.dtype == torch.float32 and y.is_contiguous()
+                and sh.dtype == torch.half and sh.is_contiguous()):
+            # run() retains router/grouped decode/dedup and its ordered FP32 sum.
+            # Fuse only the final shared add + FP16 conversion over all rows.
+            from ..modules.dsv41_fn import dsv41_fuse as FZ
+            return FZ.moe_tail([y], sh).view(shape)
+        y = y + sh.float()
         return y.type_as(x).view(shape)
 
     # ------------------------------------------------------------------ forward
@@ -643,6 +721,18 @@ class DSV41Serving(DSV41Model):
         if isinstance(self.engram_store, PrefetchRowStore):
             for pos in positions:
                 self.engram_store.prefetch(pos, torch.unique(hashes[:, :, pos, :].reshape(-1)))
+
+    @staticmethod
+    def _ahead_hashes(hasher, ids, start_pos, keep=None):
+        """Hash immutable prompt lookahead using bounded scratch, never live cache state."""
+        import copy
+        tail = min(start_pos, hasher.layout.max_ngram_size - 1)
+        scratch = copy.copy(hasher)
+        scratch.cache = torch.empty(ids.size(0), tail + ids.size(1),
+                                    dtype=hasher.cache.dtype, device=hasher.cache.device)
+        if tail:
+            scratch.cache[:, :tail] = hasher.cache[:ids.size(0), start_pos-tail:start_pos]
+        return scratch(ids, tail, keep)
 
     @torch.inference_mode()
     def _forward(self, input_ids, start_pos, st, taps, mode: str, ahead_ids=None, spans=None, hid_rows=None):
@@ -654,7 +744,27 @@ class DSV41Serving(DSV41Model):
         finally:
             self._img_rows = None
 
-    def _forward_core(self, input_ids, start_pos, st, taps, mode: str, ahead_ids=None, spans=None, hid_rows=None):
+    @torch.inference_mode()
+    def forward_stage(self, input_ids, start_pos, st, incoming=None, *, all_logits=False, taps=None,
+                      state_only=False, ahead_ids=None, hid_rows=None):
+        """One owned span, carrying materialized mHC streams AND delayed pre-mix.
+
+        Only source-aligned partitions are supported. Shared KV/index state stays
+        local; this API never transports cache handles or partial attention state.
+        """
+        if state_only and all_logits:
+            raise ValueError("state_only and all_logits are mutually exclusive")
+        if (self.layer_span[0] == 0) != (incoming is None):
+            raise ValueError("stage activation ownership differs")
+        try:
+            return self._forward_core(input_ids, start_pos, st, taps,
+                                      "none" if state_only else ("all" if all_logits else "last"),
+                                      ahead_ids=ahead_ids, hid_rows=hid_rows, incoming=incoming)
+        finally:
+            self._img_rows = None
+
+    def _forward_core(self, input_ids, start_pos, st, taps, mode: str, ahead_ids=None, spans=None, hid_rows=None,
+                      incoming=None):
         cfg = self.cfg
         input_ids = input_ids.to(self.device)
         B, L = input_ids.shape
@@ -672,55 +782,93 @@ class DSV41Serving(DSV41Model):
         img = span_mask(spans, start_pos, L, self.device)
         keep = None if img is None else (~img).unsqueeze(0)           # [1, L] rows that take part in engram
         hashes = st.hasher(input_ids, start_pos, keep) if st.hasher is not None else None
+        lookup_plans = {}  # owned by this forward; exception unwinding releases every plan
         if hashes is not None and self.engram_store is not None:
-            eg_pos = [self.lw[l].engram.pos for l in range(cfg.num_hidden_layers) if self.lw[l].engram is not None]
-            self._prefetch_engram(hashes, eg_pos)
+            eg_pos = [self.lw[l].engram.pos for l in range(*self.layer_span) if self.lw[l].engram is not None]
+            plan_rows = B == 1 and (L == 1 or (1 < L <= 8 and os.environ.get('DSV41_VERIFY_ENGRAM', '0') == '1'))
+            if plan_rows and os.environ.get('DSV41_ENGRAM_LOOKUP_PLAN', '0') == '1':
+                for pos in eg_pos:
+                    plans = [EngramLookupPlan.build(hashes[:,i:i+1,pos,:], pos, layout=st.hasher.layout)
+                             for i in range(L)]
+                    lookup_plans[pos] = plans
+                    if isinstance(self.engram_store, PrefetchRowStore):
+                        for plan in plans:
+                            self.engram_store.prefetch_plan(plan)
+            elif 1 < L <= 8 and os.environ.get('DSV41_VERIFY_ENGRAM', '0') == '1':
+                for pos in eg_pos:
+                    for i in range(L):
+                        self._prefetch_engram(hashes[:, i:i+1], [pos])
+            else:
+                self._prefetch_engram(hashes, eg_pos)
             if ahead_ids is not None and ahead_ids.numel():
-                st.ensure(start_pos + L + ahead_ids.size(1))
                 nm = span_mask(spans, start_pos + L, ahead_ids.size(1), self.device)
-                nxt = st.hasher(ahead_ids.to(self.device), start_pos + L, None if nm is None else (~nm).unsqueeze(0))
+                nxt = self._ahead_hashes(st.hasher, ahead_ids.to(self.device), start_pos + L,
+                                         None if nm is None else (~nm).unsqueeze(0))
                 self._prefetch_engram(nxt, eg_pos)
         if (mode == "last" and L == 1 and B == 1 and start_pos > 0 and taps is None and st.journal is None
-                and self.decode_graph and self._graph_ok(st)):
+                and self.layer_span == (0, cfg.num_hidden_layers) and self.decode_graph and self._graph_ok(st)):
             logits, hid = self._graph_for(st).step(input_ids, start_pos, hashes)
             st.length = max(getattr(st, "length", 0), start_pos + 1)
             return logits, hid
         self._mt(-1, 'hashes')
-        if img is None and L > self.pf_eng_rows:
-            # long chunk: the four streams are filled block by block (no fp32 [L, dim] copy next to the [L, 4, dim] result)
-            h = torch.empty(B, L, cfg.hc_mult, cfg.hidden_size, dtype=torch.float32, device=self.device)
-            for a, b in self._row_blocks(L, self.pf_eng_rows):
-                h[:, a:b] = F.embedding(input_ids[:, a:b], self.embed_w).float().unsqueeze(2)
+        if incoming is not None:
+            h, pre = incoming
+            h, pre = h.to(self.device), pre.to(self.device)
+            if (h.dtype != torch.float32 or pre.dtype != torch.float32 or
+                    tuple(h.shape) != (B, L, cfg.hc_mult, cfg.hidden_size) or
+                    tuple(pre.shape) != (B, L, cfg.hc_mult)):
+                raise ValueError("invalid mHC streams/pre-mix")
         else:
-            h = F.embedding(input_ids, self.embed_w).float()
-            if img is not None:
-                splice(h, start_pos, spans)
-                self._img_rows = img.repeat(B)
-            h = h.unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1)
+            if img is None and L > self.pf_eng_rows:
+                # long chunk: the four streams are filled block by block (no fp32 [L, dim] copy next to the [L, 4, dim] result)
+                h = torch.empty(B, L, cfg.hc_mult, cfg.hidden_size, dtype=torch.float32, device=self.device)
+                for a, b in self._row_blocks(L, self.pf_eng_rows):
+                    h[:, a:b] = F.embedding(input_ids[:, a:b], self.embed_w).float().unsqueeze(2)
+            else:
+                h = F.embedding(input_ids, self.embed_w).float()
+                if img is not None:
+                    splice(h, start_pos, spans)
+                    self._img_rows = img.repeat(B)
+                h = h.unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1)
+            pre = h.new_zeros(B, L, cfg.hc_mult)
+            pre[:, :, 0] = 1.0
         S = self.hc.new(h)
-        pre = h.new_zeros(B, L, cfg.hc_mult)
-        pre[:, :, 0] = 1.0
         rt = SharedRt()
+        verify_rt = ([SharedRt() for _ in range(L)] if self.fast_attn and B == 1 and
+                     1 < L <= 8 and start_pos > 0 and st.journal is not None and
+                     os.environ.get('DSV41_VERIFY_ATTENTION','0') == '1' else None)
+        verify_positions = None
+        if verify_rt is not None and os.environ.get('DSV41_VERIFY_POSITION_HOIST', '0') == '1':
+            positions = torch.arange(start_pos, start_pos + L, dtype=torch.int32, device=self.device)
+            slots = positions % cfg.sliding_window
+            verify_positions = list(zip(positions.split(1), slots.split(1)))
         main = []
         self._mt(-1, 'embed+S')
         if self.fast_attn and L == 1 and B == 1:
             self._pos32 = torch.tensor([start_pos], dtype=torch.int32, device=self.device)
             self._slot32 = self._pos32 % cfg.sliding_window
-        for l in range(cfg.num_hidden_layers):
+        for l in range(*self.layer_span):
             w = self.lw[l]
+            if taps is not None:
+                taps[f'L{l}.input_h'] = S.apply().view(B,L,cfg.hc_mult,-1).clone()
+                taps[f'L{l}.input_pre'] = pre.clone()
             tb = self.moe_backends.get(l)
             if L * B >= 64 and getattr(tb, "tier", None) is not None:
                 tb.tier.store.pf_wrap = ahead_ids is not None and ahead_ids.numel() > 0     # another chunk follows: layer 0 is next after the last layer
                 tb.tier.store.prefill_issue(tb.tier, L * B)     # SSD tier: start the expert reads before this layer's attention
             if w.engram is not None:
                 e = w.engram
-                S.inject(lambda hh: self._engram_rows(hh, hashes[:, :, e.pos, :], e, keep))
+                S.inject(lambda hh: self._engram_rows(hh, hashes[:, :, e.pos, :], e, keep, lookup_plans.get(e.pos)))
+                if taps is not None:
+                    taps[f'L{l}.engram_h'] = S.apply().view(B,L,cfg.hc_mult,-1).clone()
             if l in cfg.dspark_target_layer_ids and self.mtp is not None:
                 main.append(S.apply().view(B, L, cfg.hc_mult, -1)[:, -(hid_rows or L):].mean(dim=2))     # hid_rows: only the tail is read
             x = S.cn(pre, w.attn_norm)
+            if taps is not None: taps[f'L{l}.attn_input'] = x.clone()
             a_pre, a_post, a_comb = S.mix(w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
             self._mt(l, 'pre-attn')
-            y = self._attention(l, x, start_pos, st, rt, taps)
+            y = (self._attention_verify(l,x,start_pos,st,verify_rt,taps,verify_positions) if verify_rt is not None
+                 else self._attention(l, x, start_pos, st, rt, taps))
             self._mt(l, 'attn')
             if self.ablit is not None:
                 y = self._abl(l, 0, y)
@@ -728,6 +876,7 @@ class DSV41Serving(DSV41Model):
                 taps[f"L{l}.attn"] = y.clone()
             S.push(y, a_post, a_comb)
             x = S.cn(a_pre, w.ffn_norm)
+            if taps is not None: taps[f'L{l}.ffn_input'] = x.clone()
             f_pre, f_post, f_comb = S.mix(w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
             self._mt(l, 'pre-moe')
             y = self._moe(l, x, taps)
@@ -740,6 +889,8 @@ class DSV41Serving(DSV41Model):
             pre = f_pre
         st.length = max(getattr(st, "length", 0), start_pos + L)
         hid = torch.cat(main, dim=-1) if main else None
+        if self.layer_span[1] < cfg.num_hidden_layers:
+            return (S.apply().view(B, L, cfg.hc_mult, cfg.hidden_size).contiguous(), pre.contiguous()), hid
         if mode == "none":
             S.apply()
             return None, hid

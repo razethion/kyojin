@@ -50,6 +50,71 @@ def fingerprint(cfg, tag: str = "") -> str:
 POOLS = ("comp_kv", "idx_k", "idx_kq", "idx_ks")
 
 
+@dataclass(frozen=True)
+class PoolPages:
+    """Owned CPU copies; callers must never mutate pages. Only completed pages are shared."""
+    pages: tuple
+    rows: int
+    page_rows: int = 0
+
+
+def _tensors(value):
+    if isinstance(value, PoolPages):
+        yield from value.pages
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _tensors(item)
+    elif value is not None:
+        yield value
+
+
+def unique_snapshot_bytes(snaps) -> int:
+    """Resident tensor storage bytes, counting shared pages once (excludes Python metadata)."""
+    stores = {}
+    for snap in snaps:
+        for tensor in (*_tensors(snap.tensors), *_tensors(snap.hidden)):
+            storage = tensor.untyped_storage()
+            stores[(str(tensor.device), storage.data_ptr())] = storage.nbytes()
+    return sum(stores.values())
+
+
+def snapshot_bytes(cfg, st, n: int, hidden=None) -> int:
+    """Allocation upper bound before copying; ignores page reuse, includes all tensor payloads."""
+    total = sum(t.numel() * t.element_size() for t in st.win.values())
+    for name in POOLS:
+        for l, t in (getattr(st, name, None) or {}).items():
+            rows = min(-(-n // max(int(cfg.ratio(l)), 1)), t.size(1))
+            total += t.size(0) * rows * t.size(2) * t.element_size()
+    for name in ('comp_kv_state', 'comp_score_state'):
+        total += sum(t.numel() * t.element_size() for t in getattr(st, name).values())
+    if getattr(st, 'hasher', None) is not None:
+        t = st.hasher.cache[:, :n]
+        total += t.numel() * t.element_size()
+    if hidden is not None:
+        total += hidden.numel() * hidden.element_size()
+    return total
+
+
+def snapshot_increment_bytes(cfg, st, n, hidden=None, *, previous=None, page_rows=0):
+    """New tensor payload bytes for trusted live lineage whose previous remains retained."""
+    total = snapshot_bytes(cfg, st, n, hidden)
+    if not page_rows or previous is None or previous.n > n:
+        return total
+    shared = {}
+    for name in POOLS:
+        for layer, tensor in (getattr(st, name, None) or {}).items():
+            old = previous.tensors.get(name, {}).get(layer)
+            if not isinstance(old, PoolPages) or old.page_rows != page_rows:
+                continue
+            ratio = max(int(cfg.ratio(layer)), 1)
+            completed = min(n // ratio, previous.n // ratio, tensor.size(1))
+            for index, page in enumerate(old.pages):
+                if page.size(1) == page_rows and (index + 1) * page_rows <= completed:
+                    storage = page.untyped_storage()
+                    shared[(str(page.device), storage.data_ptr())] = storage.nbytes()
+    return total - sum(shared.values())
+
+
 def mem_available_gib() -> float:
     try:
         with open("/proc/meminfo") as f:
@@ -86,9 +151,18 @@ class Snapshot:
     tick: int = 0
 
 
-def snapshot(cfg, st, n: int, keys: Sequence, hidden: Any, kind: str) -> Snapshot:
+def snapshot(cfg, st, n: int, keys: Sequence, hidden: Any, kind: str, *,
+             previous: Snapshot | None = None, page_rows: int = 0,
+             trusted_previous: bool = False) -> Snapshot:
     """Copy the state of positions 0..n-1 to the host. `st` must hold exactly those positions (any extra rows are ignored)."""
     cpu = lambda t: t.detach().to("cpu", copy=True)                                  # noqa: E731
+    if page_rows < 0:
+        raise ValueError("page_rows must be nonnegative")
+    # Trusted lineage is for stages that snapshot one monotonically advancing live
+    # state. Reset/restore/release MUST invalidate it. Token keys otherwise prove
+    # lineage; an empty cluster key list never does.
+    share = previous is not None and previous.n <= n and (trusted_previous or
+        (len(previous.keys) == previous.n and len(keys) >= n and list(keys[:previous.n]) == previous.keys))
     T: dict[str, Any] = {"win": {l: cpu(t) for l, t in st.win.items()}}
     for name in POOLS:
         d = getattr(st, name, None)
@@ -97,13 +171,29 @@ def snapshot(cfg, st, n: int, keys: Sequence, hidden: Any, kind: str) -> Snapsho
         T[name] = {}
         for l, t in d.items():
             rows = min(-(-n // max(int(cfg.ratio(l)), 1)), t.size(1))
-            T[name][l] = cpu(t[:, :rows])
+            if page_rows:
+                old = previous.tensors.get(name, {}).get(l) if share else None
+                pages = []
+                completed = n // max(int(cfg.ratio(l)), 1)
+                for a in range(0, rows, page_rows):
+                    b = min(a + page_rows, rows)
+                    index = a // page_rows
+                    prior_completed = previous.n // max(int(cfg.ratio(l)), 1) if share else 0
+                    if (isinstance(old, PoolPages) and old.page_rows == page_rows and index < len(old.pages) and
+                            b - a == page_rows and b <= min(completed, prior_completed) and
+                            old.pages[index].size(1) == page_rows):
+                        pages.append(old.pages[index])
+                    else:
+                        pages.append(cpu(t[:, a:b]))
+                T[name][l] = PoolPages(tuple(pages), rows, page_rows)
+            else:
+                T[name][l] = cpu(t[:, :rows])
     T["comp_kv_state"] = {l: cpu(t) for l, t in st.comp_kv_state.items()}
     T["comp_score_state"] = {l: cpu(t) for l, t in st.comp_score_state.items()}
     if getattr(st, "hasher", None) is not None:
         T["hasher"] = cpu(st.hasher.cache[:, :n])
     h = None if hidden is None else cpu(hidden)
-    size = sum(t.numel() * t.element_size() for v in T.values() for t in (v.values() if isinstance(v, dict) else [v]))
+    size = sum(t.numel() * t.element_size() for t in _tensors(T))
     if h is not None:
         size += h.numel() * h.element_size()
     return Snapshot(list(keys[:n]), n, kind, T, h, size)
@@ -119,7 +209,13 @@ def restore(model, snap: Snapshot, max_seq: int):
         st.win[l].copy_(t)
     for name in POOLS:
         for l, t in T.get(name, {}).items():
-            getattr(st, name)[l][:, :t.size(1)].copy_(t)
+            if isinstance(t, PoolPages):
+                offset = 0
+                for page in t.pages:
+                    getattr(st, name)[l][:, offset:offset + page.size(1)].copy_(page)
+                    offset += page.size(1)
+            else:
+                getattr(st, name)[l][:, :t.size(1)].copy_(t)
     for l, t in T["comp_kv_state"].items():
         st.comp_kv_state[l].copy_(t)
     for l, t in T["comp_score_state"].items():

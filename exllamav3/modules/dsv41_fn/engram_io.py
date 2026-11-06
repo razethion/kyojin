@@ -10,6 +10,34 @@ import torch
 _SECTOR = 4096
 
 
+def native_request_bytes(rows, segments):
+    """Exact requested aligned bytes for native's one read per row/segment.
+
+    Use CPU int64 vectors, validating offset arithmetic before multiplication.
+    This counts requested bytes (including repeated sectors), not returned bytes.
+    """
+    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    if not rows.size:
+        return 0
+    if int(rows.min()) < 0:
+        raise ValueError('negative Engram row')
+    largest = int(rows.max())
+    limit = np.iinfo(np.int64).max
+    total = 0
+    for _, base, stride, size in segments:
+        base, stride, size = int(base), int(stride), int(size)
+        if base < 0 or stride < 0 or size <= 0 or base + size + _SECTOR - 1 > limit:
+            raise ValueError('invalid Engram segment offset')
+        if stride and largest > (limit - base - size - _SECTOR + 1) // stride:
+            raise OverflowError('Engram row offset exceeds int64')
+        offsets = base + rows * stride
+        sectors = (offsets + size + _SECTOR - 1) // _SECTOR - offsets // _SECTOR
+        # Sum in bounded pieces, so NumPy's int64 reduction cannot overflow.
+        block = max(1, min(1 << 20, limit // int(sectors.max())))
+        total += sum(int(sectors[a:a + block].sum()) * _SECTOR for a in range(0, len(rows), block))
+    return total
+
+
 class ParallelRowReader:
     def __init__(self, segments, threads: int = 16, allow_buffered: bool = False):
         self.segments = [(str(s[0]),) + tuple(int(v) for v in s[1:]) for s in segments]    # (path, base, stride, nbytes)
@@ -161,7 +189,8 @@ class NativeRowReader:
         self.fds = {}
 
     def read_rows(self, rows) -> torch.Tensor:
-        r = torch.as_tensor(rows, dtype=torch.int64).contiguous()
+        r = torch.as_tensor(rows, dtype=torch.int64, device='cpu').contiguous()
+        requested = native_request_bytes(r.numpy(), self.segments)
         out = torch.empty(r.numel(), self.row_bytes, dtype=torch.uint8)
         if self._pool:
             err = _gather_lib().ds_engram_pool_gather(self._small if r.numel() < 1024 else self._pool, self._fd, self._base, self._stride, self._nb, len(self.segments),
@@ -172,5 +201,5 @@ class NativeRowReader:
         if err:
             raise IOError(f"ds_engram_gather failed ({err})")
         self.reads += r.numel() * len(self.segments)
-        self.bytes_read += self.reads * 4096
+        self.bytes_read += requested
         return out

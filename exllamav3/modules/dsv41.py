@@ -94,6 +94,7 @@ class DSV41Raw(Module):
         self.names = list(names)
         self.optional = list(optional)
         self.t = {}
+        self.decoded_exl3 = {}
 
     @override
     def optimizer_targets(self):
@@ -104,7 +105,32 @@ class DSV41Raw(Module):
         super().load(device, **kwargs)          # child modules (MTP extras host a Linear)
         stc = self.config.stc
         for n in self.names:
-            self.t[n] = stc.get_tensor(n, device, allow_bf16 = True, no_defer = True).contiguous()
+            if (not stc.has_tensor(n) and n.endswith('.weight') and
+                    '.attn.compressor.' in n and stc.has_tensor(n[:-7] + '.trellis')):
+                # Turboderp's standard pack quantizes these small matrices. The
+                # reference compressor requires FP32 accumulation, including its
+                # gate scores, so expand just these matrices once at load time.
+                # Keep every pack byte intact; no new quantization or dense MoE.
+                key = n[:-7]
+                i = stc.get_tensor_meta(key + '.suh')[key + '.suh']['shape'][0]
+                o = stc.get_tensor_meta(key + '.svh')[key + '.svh']['shape'][0]
+                if i * o > 16 * 1024**2:
+                    raise ValueError('unexpectedly large raw EXL3 compressor')
+                lin = Linear(self.config, key, i, o, out_dtype=torch.float32, no_defer_load=True)
+                lin.load(device)
+                self.t[n] = lin.inner.get_weight_tensor().float().T.contiguous()
+                if tuple(self.t[n].shape) != (o, i) or not bool(self.t[n].isfinite().all()):
+                    raise ValueError('invalid reconstructed compressor matrix')
+                self.decoded_exl3[n] = self.t[n].numel() * self.t[n].element_size()
+                lin.unload()
+            else:
+                key = n
+                if not stc.has_tensor(key):
+                    # Standard EXL3 renamed these two DSpark tensors. The port
+                    # keeps the official checkpoint names in its WeightSource.
+                    key = key.replace('.markov_head.embed.weight', '.markov_head.markov_w1.weight')
+                    key = key.replace('.markov_head.head.weight', '.markov_head.markov_w2.weight')
+                self.t[n] = stc.get_tensor(key, device, allow_bf16 = True, no_defer = True).contiguous()
         for n in self.optional:
             if stc.has_tensor(n):
                 self.t[n] = stc.get_tensor(n, device, allow_bf16 = True, no_defer = True).contiguous()

@@ -244,7 +244,11 @@ _DEC_KB2_DENSE = _DEC_KB2 + (14,)
 # purpose: this change keeps shared-expert and routed-MoE eligibility as it was. Add a shape only together with a real-weight
 # run of tools/qwen/check_dense_k8.py.
 _DENSE_K8_SHAPES = {(2560, 512), (2560, 6144), (2560, 10240),
-                    (2560, 12288), (6144, 2560)}
+                    (2560, 12288), (6144, 2560),
+                    # GLM5Next KDA/MLA attention shapes; gated by the same
+                    # explicit K8 opt-in and qualified with real-weight tests.
+                    (4096, 24576), (8192, 4096), (4096, 1536),
+                    (1536, 16384), (4096, 512), (16384, 4096), (1536, 4096)}
 # ROCm carries 9..32 rows per exl3_dec_gemv_r call: R * kbs * N partial sums of a wide dense projection (GDN qkvz at 28+ rows) outgrow 2M floats
 DEC_SCRATCH_FLOATS = (8 << 20) if torch.version.hip else (2 << 20)
 # arrival counters: the 8-row kernels fit 4096; a 32-row GEMV of a wide N (lm_head: 32 * ceil(N / 512)) needs up to ~16k

@@ -31,8 +31,8 @@ __device__ __forceinline__ v16h ld16h(const half_t* p) {
 
 // q [R, 64, 512] fp16, kv [N, 512] fp16, idx [R, K] int32, sink [64] fp32, o [R, 64, 512] fp16. grid = R, block 512.
 extern "C" __global__ __launch_bounds__(512) void ds41_sparse_attn_pf(
-    const half_t* __restrict__ q, const half_t* __restrict__ kv, const int* __restrict__ idx, const float* __restrict__ sink,
-    half_t* __restrict__ o, int K, int N, float scale)
+    const half_t* __restrict__ q, const half_t* __restrict__ kv, const half_t* __restrict__ pool, const int* __restrict__ idx, const float* __restrict__ sink,
+    half_t* __restrict__ o, int K, int NW, int N, float scale)
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x, wv = tid >> 5, lane = tid & 31;
@@ -51,14 +51,16 @@ extern "C" __global__ __launch_bounds__(512) void ds41_sparse_attn_pf(
     // The keys of chunk c + 1 are loaded into registers while chunk c computes (key j = tid >> 4, 16 threads per key, 4 x 16 B each), and
     // written to LDS at the top of the next iteration: the global-load latency hides behind QK / softmax / PV. Math unchanged.
     const int kj = tid >> 4, kpart = tid & 15;
-    const half_t* kvrow = kv;
     int ptok = -1;
     v4u pre[4];
 #define DS41_PF_FETCH(cc) { \
         const int kk_ = (cc) * BN + kj; \
         const int id_ = (cc) < nch && kk_ < K ? idx[(int64_t) row * K + kk_] : -1; \
         ptok = id_ >= 0 ? min(id_, N - 1) : -1; \
-        const v4u* src_ = (const v4u*) (kvrow + (int64_t) max(ptok, 0) * HD) + kpart * 4; \
+        const int tok_ = max(ptok, 0); \
+        const half_t* base_ = tok_ < NW ? kv : pool; \
+        const int off_ = tok_ < NW ? tok_ : tok_ - NW; \
+        const v4u* src_ = (const v4u*) (base_ + (int64_t) off_ * HD) + kpart * 4; \
         _Pragma("unroll") for (int e_ = 0; e_ < 4; ++e_) pre[e_] = ptok >= 0 ? src_[e_] : (v4u) {0, 0, 0, 0}; }
     DS41_PF_FETCH(0)
     for (int c = 0; c < nch; ++c) {

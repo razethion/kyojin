@@ -673,7 +673,10 @@ static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, 
     int* cnt = counters(a.device().index());   // allocated on the first (eager) call, never under capture
 
     // W2: two ADJACENT columns per lane needs an even row stride (4 B aligned pair) and one full warp of pairs.
-    const int cpl = (w2on() && (n % 2 == 0) && n >= 2 * COLS) ? 2 : 1;
+    // Padded 9..32-row instantiations below use CPL=1. Their launch grid must
+    // therefore cover COLS columns per block too; a CPL=2 grid leaves half the
+    // output columns unwritten when launch_partials_cpl falls back to CPL=1.
+    const int cpl = (m <= EXACT_M && w2on() && (n % 2 == 0) && n >= 2 * COLS) ? 2 : 1;
     dim3 grid((n + COLS * cpl - 1) / (COLS * cpl), ksplit);
     if (onepass())
     {

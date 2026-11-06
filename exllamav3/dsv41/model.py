@@ -10,6 +10,7 @@ Reference: DeepSeek-V4.1-Flash inference/model.py (line numbers in the comments)
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+import os
 import torch
 import torch.nn.functional as F
 from .config import DSV41Config
@@ -57,6 +58,7 @@ class DSV41State:
         if length > self.win[0].size(1):
             raise ValueError(f"verify block of {length} tokens exceeds the sliding window ({self.win[0].size(1)})")
         self.journal = _BlockJournal(start_pos, length)
+        self.journal.batch_ring = os.environ.get("DSV41_VERIFY_RING_BATCH", "0") == "1"
 
     def end_block(self):
         self.journal = None
@@ -67,6 +69,15 @@ class DSV41State:
             return
         ring = self.win[l]
         W = ring.size(1)
+        if j.batch_ring:
+            # length <= W: every position owns a distinct slot, including across wrap.
+            # Snapshot all rows before this layer's first write. Compressor records
+            # remain chronological because their slots may repeat within a block.
+            if l not in j.ring:
+                block_positions = list(range(j.start, j.start + j.length))
+                slots = torch.arange(j.start, j.start + j.length, device=ring.device) % W
+                j.ring[l] = [(block_positions, ring[:B, slots].clone())]
+            return
         slots = torch.tensor([p % W for p in positions], device=ring.device)
         j.ring.setdefault(l, []).append((list(positions), ring[:B, slots].clone()))
 
@@ -105,6 +116,7 @@ class DSV41State:
 class _BlockJournal:
     def __init__(self, start: int, length: int):
         self.start, self.length = start, length
+        self.batch_ring = False
         self.ring = {}      # layer -> [(positions, old ring rows [B, n, hd])]
         self.comp = {}      # layer -> [(position, slot, old kv_state row, old score_state row)]
 

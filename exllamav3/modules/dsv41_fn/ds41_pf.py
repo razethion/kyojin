@@ -87,18 +87,21 @@ def usable(q, kv, idx, sink) -> bool:
             and kv.dim() == 3 and kv.size(2) == 512 and sink.numel() == 64)
 
 
-def sparse_attention(q, kv, sink, idx, scale):
-    """ops.sparse_attention for q [1, R, 64, 512] fp16, kv [1, N, 512] fp16, idx [1, R, K] int32 (-1 masked), sink [64]."""
-    R, K, N = q.size(1), idx.size(-1), kv.size(1)
+def sparse_attention(q, kv, sink, idx, scale, kv_pool=None):
+    """ops.sparse_attention for q [1, R, 64, 512] fp16, kv [1, N, 512] fp16, idx [1, R, K] int32 (-1 masked), sink [64]. kv_pool extends the logical key list without copying history."""
+    R, K, NW = q.size(1), idx.size(-1), kv.size(1)
+    kv_pool = kv[:, :0] if kv_pool is None else kv_pool
+    N = NW + kv_pool.size(1)
     q = q.contiguous()
     kv = kv.contiguous()
+    kv_pool = kv_pool.contiguous()
     idx = idx.to(torch.int32).contiguous()
     sink = sink.float().contiguous()
     o = torch.empty_like(q)
     if K == 0 or N == 0:
         return o.zero_()
     fn = _fn("ds41_sparse_attn_pf")
-    cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, kv, idx, sink, o)] + [ctypes.c_int(K), ctypes.c_int(N), ctypes.c_float(scale)]
+    cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, kv, kv_pool, idx, sink, o)] + [ctypes.c_int(K), ctypes.c_int(NW), ctypes.c_int(N), ctypes.c_float(scale)]
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
     r = _state["lib"].hipModuleLaunchKernel(fn, R, 1, 1, 512, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
     if r != 0:

@@ -330,6 +330,8 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
                             max_tokens=token_limit(body, defaults.max_tokens), temperature=body.get("temperature", 0.0),
                             top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
                             cancel=body.get("_cancel"),
+                            **({key: body[key] for key in ('seed', 'speculative', 'repetition_guard') if key in body}
+                               if getattr(engine, 'supports_sampling', False) else {}),
                             **({"prompt_ids": body["_prompt_ids"]} if body.get("_prompt_ids") is not None else {}),
                             **({"images": body["_images"]} if body.get("_images") else {}),
                             **({"ignore_eos": True} if body.get("_ignore_eos") else {}),
@@ -628,6 +630,8 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
                    "top_p": float(defaults.top_p if body.get("top_p") is None else body["top_p"]),
                    "_stop": [stops] if isinstance(stops, str) else list(stops),
                    "cache_prompt": body.get("cache_prompt", True), "_cache_salt": salt_of(body)}
+            if getattr(engine, "supports_sampling", False):
+                job.update({k: body[k] for k in ("seed", "speculative", "repetition_guard") if k in body})
         except (json.JSONDecodeError, web.HTTPException, TypeError, ValueError) as exc:
             if isinstance(exc, web.HTTPException):
                 raise
@@ -735,6 +739,8 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
                    "temperature": float(defaults.temperature if body.get("temperature") is None else body["temperature"]),
                    "top_p": float(defaults.top_p if body.get("top_p") is None else body["top_p"]),
                    "cache_prompt": body.get("cache_prompt", True), "_cache_salt": salt_of(body)}
+            if getattr(engine, "supports_sampling", False):
+                job.update({k: body[k] for k in ("seed", "speculative", "repetition_guard") if k in body})
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise web.HTTPBadRequest(reason=str(exc)) from exc
 

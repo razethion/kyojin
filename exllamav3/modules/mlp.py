@@ -762,7 +762,8 @@ class GatedMLP(Module):
                 # inside) instead of 2 x (had_in + exl3_gemv + had_out); down goes to gemv_r via
                 # LinearEXL3.forward. Same activation call as the unfused branch below.
                 if (
-                    VERIFY_FUSE["on"] and 1 < bsz * q_len <= MAX_BSZN_GEMV_R and
+                    VERIFY_FUSE["on"] and os.environ.get("EXL3_VERIFY_FUSE_PAIR", "1") != "0" and
+                    1 < bsz * q_len <= MAX_BSZN_GEMV_R and
                     params.get("dflash_verify") and x.dtype == torch.half and x.is_contiguous() and
                     hasattr(ext, "exl3_dec_gemv_r_multi") and
                     _vf_plain_exl3(self.gates[s], dim) and _vf_plain_exl3(self.ups[s], dim) and

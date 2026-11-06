@@ -1,0 +1,90 @@
+{
+  "cache_tokens": 524288,
+  "context_per_session": 262144,
+  "environment": {
+    "DS41_CLUSTER_ADAPTIVE": "0",
+    "DS41_CLUSTER_FAST_TOP_P": "1",
+    "DS41_CLUSTER_IDLE_RELEASE": "1",
+    "DS41_CLUSTER_PAIRED_DRAFT_OVERLAP": "1",
+    "DS41_CLUSTER_PREFILL_NATIVE": "1",
+    "DS41_CLUSTER_PREFILL_PIPELINE": "1",
+    "DS41_CLUSTER_PREFILL_WINDOW": "16",
+    "DS41_CLUSTER_PREFIX": "1",
+    "DS41_CLUSTER_WORKER_SAMPLING": "1",
+    "DS41_PFX_PAGE_ROWS": "128",
+    "DSV41_CANONICAL_CANDIDATE_ORDER": "1",
+    "DSV41_DECODE_GRAPH": "0",
+    "DSV41_DRAFT_PARTIAL_HEAD": "0",
+    "DSV41_DRAFT_SKIP_CONF": "0",
+    "DSV41_ENGRAM_LOOKUP_PLAN": "0",
+    "DSV41_ENGRAM_PREPARED_CPU": "0",
+    "DSV41_FUSE": "1",
+    "DSV41_GROUPED_MOE": "1",
+    "DSV41_IDX_PACKED": "0",
+    "DSV41_KERNELS": "1",
+    "DSV41_MTP_SAFE_PROJECT": "1",
+    "DSV41_PF_DUAL_POOL": "0",
+    "DSV41_POOL_GROWTH": "linear",
+    "DSV41_UNIFIED_K25": "1",
+    "DSV41_VERIFY_ATTENTION": "1",
+    "DSV41_VERIFY_ENGRAM": "1",
+    "DSV41_VERIFY_FUSE": "1",
+    "DSV41_VERIFY_MOE_TAIL": "0",
+    "DSV41_VERIFY_POSITION_HOIST": "1",
+    "DSV41_VERIFY_RING_BATCH": "0",
+    "EXL3_BLOCK_GRAPH": "0",
+    "EXL3_DENSE_K8": "1",
+    "EXL3_GEMV_R_DEC1": "1",
+    "EXL3_KVWIN": "0",
+    "EXL3_MPW2_VARIANT": "4",
+    "EXL3_PF7_OPT": "0",
+    "EXL3_PF7_PF": "2",
+    "EXL3_VERIFY_FUSE": "1",
+    "EXL3_VERIFY_FUSE_PAIR": "0",
+    "MALLOC_MMAP_THRESHOLD_": "1048576",
+    "MPW_KERN": "2",
+    "MPW_MT": "64",
+    "MPW_NW": "2"
+  },
+  "layer_spans": [
+    [
+      0,
+      20
+    ],
+    [
+      20,
+      40
+    ]
+  ],
+  "max_prefill_rows": 1024,
+  "minimum_free_gib": 2,
+  "model": "turboderp/DeepSeek-V4.1-Flash-1017-exl3",
+  "module_spans": [
+    [
+      0,
+      22
+    ],
+    [
+      22,
+      44
+    ]
+  ],
+  "native_binary_sha256": "9166e16baaf2c6be094bdd66b458993f45c3a2c7cd88b8519961da5195c7759a",
+  "ngram": "original FP8 pack, disk-backed direct row reads",
+  "prefill_chunk": 256,
+  "prefix_budget_bytes_per_node": 2147483648,
+  "prefix_cache": true,
+  "prefix_generated_state": false,
+  "prefix_grid_tokens": 4096,
+  "prefix_max_entries": 16,
+  "requested_draft_depth": 3,
+  "revision": "608c237e95188739612e435a935ffa614b9c40e9",
+  "sessions": 2,
+  "status": "Deployed coordinator example, 2026-11-05; adapt paths, addresses and authentication before use",
+  "example_notes": [
+    "Coordinator settings; the worker profile at this audit did not yet set MALLOC_MMAP_THRESHOLD_.",
+    "source_id is recomputed from the source tree at launch; do not reuse a stale receipt.",
+    "cache_tokens is configured capacity, not a full-context/two-session residency certification.",
+    "Separate authentication token files and model files are intentionally not included."
+  ]
+}

@@ -1,11 +1,38 @@
 # Environment variables
 
+For the experimental two-host GLM4.10 preset, `EXL3_DENSE_K8=1` also enables the
+seven qualified GLM KDA/MLA/indexer shapes. `EXL3_VERIFY_FUSE_PAIR=0` disables
+only the paired gate/up verification launch; `EXL3_VERIFY_FUSE=1` keeps the other
+fused verification projections enabled. The pair switch defaults to1. See
+[the measured configuration and parity scope](multinode.md#glm410-parity-and-k8-optimization-november2).
+
 Runtime and build-time toggles recognized by ExLlamaV3. All of these have sensible defaults;
 they exist mainly for A/B testing, debugging and working around platform quirks.
 
 Boolean-ish variables treat `0` as off and any other value as on unless noted. C++-side
 variables are read once (on first use) and cached; Python-side variables are read at import
 time. Either way, set them before loading a model.
+
+## Deployed DeepSeek cluster host allocator
+
+### `MALLOC_MMAP_THRESHOLD_` (glibc; unset by the general runtime)
+
+The November 5 two-node DeepSeek deployment sets `MALLOC_MMAP_THRESHOLD_=1048576`
+in the **coordinator's** startup profile. The worker profile leaves it unset.
+This glibc setting fixes the allocation threshold at 1 MiB so qualifying large
+host allocations can be released through `mmap`, limiting freed arena retention
+seen during repeated long chat requests. Set it before starting the process.
+It does not change model weights, token sampling, context geometry or the
+physical-memory guard.
+
+The bounded reproduction showed stable post-request RSS with this setting;
+it does not establish an eight-hour soak result or identify the exact native
+allocation callsite. Diagnostic `PYTHONPATH` and `KYOJIN_MEMORY_DIAG` overrides
+were removed from the persisted profile. The process inspected on November 5
+still contained its passive diagnostic sampler until its next restart; that
+sampler is not part of the permanent deployment configuration. See the
+[deployed baseline](cluster-deployed-baseline-20261105.md) for measurements and
+limits.
 
 ## Persistent prompt cache (GLM, Qwen, DS4.1 servers)
 

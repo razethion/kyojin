@@ -9,7 +9,7 @@ from exllamav3.util.hip_lib import load_hip_runtime
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_DIR, "dsv41_moe.hip")
-_FUNCS = ("ds41m_had_in", "ds41m_valu_gu", "ds41m_valu_down", "ds41m_mid", "ds41m_final")
+_FUNCS = ("ds41m_had_in", "ds41m_valu_gu", "ds41m_valu_down", "ds41m_mid", "ds41m_final", "ds41m_k25_gu", "ds41m_k25_down")
 _EXT = os.path.join(os.path.dirname(os.path.dirname(_DIR)), "exllamav3_ext")
 _HEADERS = ("quant/exl3_moe_valu.cuh", "quant/exl3_moe_valu_idx.h", "quant/exl3_gemv_kernel.cuh", "quant/hadamard_inner.cuh",
             "quant/exl3_dq.cuh", "quant/codebook.cuh", "compat.cuh", "compat_rocm.cuh", "util.cuh")
@@ -98,7 +98,8 @@ class UnifiedMoE:
         self.store, self.outs, self.limit = store, outs, float(limit)
         E = store.num_experts
         self.G = store.num_groups
-        assert self.G <= 3 and all(g.k_gu in (1.0, 2.0, 3.0, 4.0) for g in store.groups)
+        self.half25 = self.G == 1 and store.groups[0].k_gu == 2.5
+        assert self.G <= 3 and (self.half25 or all(g.k_gu in (1.0, 2.0, 3.0, 4.0) for g in store.groups))
 
         self._gidx = [torch.tensor(g.experts, dtype=torch.long, device=dev) for g in store.groups]
 
@@ -124,11 +125,13 @@ class UnifiedMoE:
         self._x = self._sel = self._wh = None
         self.l_had = _L("ds41m_had_in", (2 * K, H_ // 128), 32,
                         (buffers.gu_had, buffers.gu_had, buffers.gu_had, t["gsuh"], t["usuh"], H_, E))
-        self.l_gu = _L("ds41m_valu_gu", (mv_grid_x(I_ // 16), K, 2), 32 * _W(),
+        self.l_gu = _L("ds41m_k25_gu" if self.half25 else "ds41m_valu_gu",
+                       (I_//32 if self.half25 else mv_grid_x(I_ // 16), K, 2), 512 if self.half25 else 32 * _W(),
                        (buffers.gu_had, buffers.gu_had, self.kbits, t["gt"], t["ut"], buffers.gu_out, H_, I_, E))
         self.l_mid = _L("ds41m_mid", (K, I_ // 128), 32,
                         (buffers.gu_out, buffers.down_had, buffers.gu_had, t["gsvh"], t["usvh"], t["dsuh"], I_, E, self.limit))
-        self.l_down = _L("ds41m_valu_down", (mv_grid_x(H_ // 16), K, 1), 32 * _W(),
+        self.l_down = _L("ds41m_k25_down" if self.half25 else "ds41m_valu_down",
+                         (H_//32 if self.half25 else mv_grid_x(H_ // 16), K, 1), 512 if self.half25 else 32 * _W(),
                          (buffers.down_had, buffers.gu_had, self.kbits, t["dt"], t["dt"], buffers.down_out, I_, H_, E))
         o = list(outs) + [None] * (3 - len(outs))
         self.l_final = _L("ds41m_final", (1, H_ // 128), 32,

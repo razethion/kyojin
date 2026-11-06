@@ -56,6 +56,29 @@ class DSparkHeads:
         if mh is not self.markov_head:
             self._mh = mh
 
+    def _project_main(self, main_hidden):
+        """Project draft conditioning with optional power-of-two overflow protection.
+
+        PackLin casts inputs/outputs to FP16 internally. Keep large target mHC
+        rows in range before that cast, then normalize in the scaled domain:
+        rmsnorm(s*y, eps*s*s) == rmsnorm(y, eps) for positive row scale s.
+        This is draft-only; no target weights, activations or caches are changed.
+        """
+        eps = self.m.cfg.rms_norm_eps
+        if os.environ.get("DSV41_MTP_SAFE_PROJECT", "0") != "1":
+            return ops.rmsnorm(self.main_proj(main_hidden), self.main_norm, eps)
+        inner = getattr(getattr(self.main_proj, "lin", None), "inner", self.main_proj)
+        if getattr(inner, "bias", None) is not None:
+            raise ValueError("safe MTP main projection requires a bias-free linear")
+        maximum = main_hidden.float().abs().amax(dim=-1, keepdim=True)
+        _, exponent = torch.frexp(maximum)
+        # Inputs <=128 retain scale=1 and exactly the existing normal-row math.
+        # Larger rows land in [64,128), with ample FP16 Hadamard headroom.
+        scaled = torch.ldexp(torch.ones_like(maximum), (7 - exponent).clamp(max=0))
+        scale = torch.where(maximum <= 128, torch.ones_like(maximum), scaled)
+        projected = self.main_proj(main_hidden * scale.to(main_hidden.dtype))
+        return ops.rmsnorm(projected, self.main_norm, eps * scale.square())
+
     # -------------------------------------------------------------- attention
     def _attn(self, l, x, start_pos, main_x, st):
         m, cfg, w = self.m, self.m.cfg, self.m.lw[l]
@@ -136,7 +159,7 @@ class DSparkHeads:
         m, cfg = self.m, self.m.cfg
         n, win, rd = cfg.num_hidden_layers, cfg.sliding_window, cfg.qk_rope_head_dim
         B, S, _ = main_hidden.shape
-        main_x = ops.rmsnorm(self.main_proj(main_hidden), self.main_norm, cfg.rms_norm_eps)
+        main_x = self._project_main(main_hidden)
         fc = m._rope_for(0, st.max_seq)[start_pos:start_pos + S]
         keep = min(S, win)                                    # position p lives in slot p % win; older rows are overwritten
         slots = torch.tensor([(start_pos + i) % win for i in range(S - keep, S)], device=main_x.device)
@@ -148,13 +171,17 @@ class DSparkHeads:
             st.win[n + j][:B, slots] = mkv[:, S - keep:].to(st.win[n + j].dtype)
 
     @torch.inference_mode()
-    def forward_spec(self, input_ids: torch.Tensor, main_hidden: torch.Tensor, start_pos: int, st, taps=None):
+    def forward_spec(self, input_ids: torch.Tensor, main_hidden: torch.Tensor, start_pos: int, st, taps=None,
+                     n_proposals: int | None = None, want_conf: bool = True):
         """input_ids [B] (the token just produced), main_hidden [B,S,len(targets)*dim].
-        Prefill returns None (only seeds the rings); decode returns (output_ids [B,blk+1], logits, confidence)."""
+        Prefill returns None (only seeds the rings); decode returns (output_ids, logits, confidence).
+        n_proposals limits sequential Markov work, not the bidirectional trunk or base head.
+        With a limit, only the first n_proposals logits include Markov bias; output IDs and
+        confidence contain exactly that many proposals. None retains the legacy full block."""
         m, cfg = self.m, self.m.cfg
         n = cfg.num_hidden_layers
         input_ids = input_ids.to(m.device)
-        main_x = ops.rmsnorm(self.main_proj(main_hidden), self.main_norm, cfg.rms_norm_eps)
+        main_x = self._project_main(main_hidden)
         blk = cfg.dspark_block_size
         draft = input_ids.new_full([input_ids.size(0), blk], cfg.dspark_noise_token_id)
         draft[:, 0] = input_ids
@@ -167,31 +194,37 @@ class DSparkHeads:
             for j in range(self.n_stages):
                 pre_mix = self._block_hip(n + j, S, pre_mix, start_pos, main_x, st)
             h = S.apply().view(h.shape)
-            return self._head(h, pre_mix, input_ids, taps)
+            return self._head(h, pre_mix, input_ids, taps, n_proposals, want_conf)
         for j in range(self.n_stages):
             h, pre_mix = self._block(n + j, h, start_pos, pre_mix, main_x, st, taps)
         if start_pos == 0:
             return None
-        return self._head(h, pre_mix, input_ids, taps)
+        return self._head(h, pre_mix, input_ids, taps, n_proposals, want_conf)
 
-    def _head(self, h, pre_mix, input_ids, taps=None):
+    def _head(self, h, pre_mix, input_ids, taps=None, n_proposals: int | None = None, want_conf: bool = True):
         cfg = self.m.cfg
         blk = cfg.dspark_block_size
+        count = blk if n_proposals is None else int(n_proposals)
+        if not 1 <= count <= blk:
+            raise ValueError("n_proposals must be between 1 and dspark_block_size")
         x = ops.hc_pre(h, pre_mix)
         xn = ops.rmsnorm(x, self.norm, cfg.rms_norm_eps)
         rh = self.rhead
         logits = rh(xn) if rh is not None else self.m.head_logits(xn)
         mh = self._mh if self._mh is not None else self.markov_head
-        out = input_ids.new_empty(input_ids.size(0), blk + 1)
+        out = input_ids.new_empty(input_ids.size(0), count + 1)
         out[:, 0] = input_ids
         embeds = []
-        for i in range(blk):
+        for i in range(count):
             e = F.embedding(out[:, i], self.markov_embed)
             bias = F.linear(e.to(mh.dtype), mh).float()
             logits[:, i].add_(bias)
-            embeds.append(e)
+            if want_conf:
+                embeds.append(e)
             a = logits[:, i].argmax(-1)
             out[:, i + 1] = a if rh is None else rh.ids[a]
-        me = torch.stack(embeds, dim=1)
-        conf = F.linear(torch.cat([x, me], dim=-1).float(), self.conf).squeeze(-1)
+        conf = None
+        if want_conf:
+            me = torch.stack(embeds, dim=1)
+            conf = F.linear(torch.cat([x[:, :count], me], dim=-1).float(), self.conf).squeeze(-1)
         return out, logits, conf

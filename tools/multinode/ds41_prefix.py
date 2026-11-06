@@ -4,7 +4,10 @@ from uuid import uuid4
 
 class PrefixPool:
     def __init__(self, pipeline, *, budget=2 << 30, entries=16, grid=4096,
-                 user_id=None, assistant_id=None):
+                 user_id=None, assistant_id=None, token_budget=None):
+        if token_budget is not None and (type(token_budget) is not int or token_budget < 0):
+            raise ValueError('retained prefix token budget must be a nonnegative integer')
+        self.token_budget = token_budget
         self.pipe, self.budget, self.limit, self.grid = pipeline, budget, entries, grid
         self.user_id, self.assistant_id = user_id, assistant_id
         self.items = []
@@ -59,6 +62,7 @@ class PrefixPool:
     def save(self, request):
         if not request.cache_prompt or len(request.fed) < 2: return
         keys = request.fed
+        if self.token_budget is not None and len(keys) > self.token_budget: return
         if any(e['keys'] == keys for e in self.items): return
         key = uuid4().hex
         if self.limit < 1: return
@@ -66,7 +70,8 @@ class PrefixPool:
             estimates = self.call('prefix_estimate', dict(session=request.name, key=key))
             self.physical = [r['physical_bytes'] for r in estimates]
             over = any(r['physical_bytes'] + r['increment_bytes'] > self.budget for r in estimates)
-            if len(self.items) < self.limit and not over: break
+            token_over = self.token_budget is not None and sum(e['n'] for e in self.items) + len(keys) > self.token_budget
+            if len(self.items) < self.limit and not over and not token_over: break
             if not self.items: return
             old = self.items.pop(0)
             self.call('prefix_drop', dict(key=old['key']))
@@ -95,6 +100,7 @@ class PrefixPool:
 
     def stats(self):
         return dict(entries=len(self.items), hits=self.hits, reused_tokens=self.reused,
+                    retained_tokens=sum(e['n'] for e in self.items), token_budget=self.token_budget,
                     bytes_per_node=list(self.physical),
                     logical_bytes_per_node=[sum(e['sizes'][i] for e in self.items)
                                             for i in range(len(self.pipe.clients))])

@@ -13,11 +13,11 @@ class PrefixTests(unittest.TestCase):
         torch.set_num_threads(2)
         cls.cfg,cls.full,cls.a,cls.b=world()
 
-    def core(self, entries=8,budget=8<<20):
+    def core(self, entries=8,budget=8<<20,token_budget=None):
         stages=[DeepSeekStage(m,model_id='tiny',source_id='same',context=256,
                   sessions=2,depth=4,max_rows=32) for m in (self.a,self.b)]
         pipe=SpeculativePipeline([Local(s) for s in stages],mode=MODE)
-        pool=PrefixPool(pipe,entries=entries,budget=budget,grid=32,assistant_id=99)
+        pool=PrefixPool(pipe,entries=entries,budget=budget,grid=32,assistant_id=99,token_budget=token_budget)
         return GreedyEngine(pipe,vocab_size=512,prefill_chunk=16,adaptive_drafting=False,
                            prefix_pool=pool),stages
 
@@ -100,6 +100,30 @@ class PrefixTests(unittest.TestCase):
             actual,r=self.run_request(core,[5,8,12]*24)
             self.assertEqual(expected,actual);self.assertEqual(r.cached_tokens,71)
             core.close()
+
+    def test_retained_token_budget_preserves_repeat_and_bounds_distinct_prompts(self):
+        core,stages=self.core(token_budget=120)
+        first=[3,5,7]*27
+        expected,_=self.run_request(core,first,cache=False)
+        self.run_request(core,first)
+        actual,repeat=self.run_request(core,first)
+        self.assertEqual(actual,expected)
+        self.assertEqual(repeat.cached_tokens,len(first)-1)
+        for token in (11,13,17):
+            self.run_request(core,[token]*85)
+            stats=core.prefix_pool.stats()
+            self.assertLessEqual(stats['retained_tokens'],120)
+            self.assertEqual(stats['retained_tokens'],sum(e['n'] for e in core.prefix_pool.items))
+            self.assertEqual(stats['token_budget'],120)
+        self.assertFalse(any(e['keys']==first[:-1] for e in core.prefix_pool.items))
+        core.close()
+
+    def test_zero_retained_token_budget_disables_saving(self):
+        core,_=self.core(token_budget=0)
+        self.run_request(core,[3]*81)
+        self.assertEqual(core.prefix_pool.stats()['retained_tokens'],0)
+        self.assertFalse(core.prefix_pool.items)
+        core.close()
 
 
 class PolicyTests(unittest.TestCase):

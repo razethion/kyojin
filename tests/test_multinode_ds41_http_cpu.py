@@ -43,6 +43,19 @@ class DeepSeekHttpTests(unittest.IsolatedAsyncioTestCase):
         self.core.pipeline.close()
         self.assertEqual((await self.client.get('/health')).status,503)
 
+    async def test_active_and_retained_cache_budgets_are_reported_separately(self):
+        from types import SimpleNamespace
+        self.core.prefix_pool=SimpleNamespace(token_budget=256,stats=lambda:dict(retained_tokens=0))
+        try:
+            d=await (await self.client.get('/health')).json()
+            self.assertEqual(d['max_context'],256)
+            self.assertEqual(d['sessions'],2)
+            self.assertEqual(d['active_cache_tokens'],512)
+            self.assertEqual(d['retained_cache_tokens'],256)
+            self.assertEqual(d['cache_tokens'],768)
+        finally:
+            self.core.prefix_pool=None
+
     def test_native_chat_tool_syntax_is_preserved(self):
         http = load_http()
         prompt = http.ds41_chat.render_chat([{'role':'user','content':'Hello'}], thinking=True,

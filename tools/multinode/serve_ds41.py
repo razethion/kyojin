@@ -57,7 +57,10 @@ def create_app(engine, model_id):
         if request.method == 'GET' and request.path in ('/health', '/v1/models') and response.status == 200:
             data = json.loads(response.text)
             geometry = dict(max_context=engine.ctx, context_window=engine.ctx, sessions=engine.sessions,
-                cache_tokens=engine.ctx * engine.sessions, clustered=True, greedy_only=False, default_temperature=1.0, default_top_p=.95, repetition_guard=True,
+                cache_tokens=engine.ctx * engine.sessions + (engine.core.prefix_pool.token_budget or 0 if engine.core.prefix_pool else 0),
+                active_cache_tokens=engine.ctx * engine.sessions,
+                retained_cache_tokens=(engine.core.prefix_pool.token_budget or 0 if engine.core.prefix_pool else 0),
+                clustered=True, greedy_only=False, default_temperature=1.0, default_top_p=.95, repetition_guard=True,
                 worker_heartbeats=engine.heartbeats, draft_depth=engine.ndt,
                 prefix_cache=engine.core.prefix_pool is not None,
                 prefix_stats=engine.core.prefix_pool.stats() if engine.core.prefix_pool else None,
@@ -95,6 +98,7 @@ def main():
     ap.add_argument('--peer-port', type=int, default=9034)
     ap.add_argument('--context', type=int, default=262144)
     ap.add_argument('--sessions', type=int, default=2)
+    ap.add_argument('--cache-tokens', type=int, help='Total active plus retained-prefix token budget; active slots are context times sessions')
     ap.add_argument('--depth', type=int, choices=range(1, 6), default=4)
     ap.add_argument('--draft-depth', type=int, choices=range(1,6), help='serving depth within the owned capacity')
     ap.add_argument('--chunk', type=int, default=256)
@@ -106,8 +110,14 @@ def main():
     ap.add_argument('--optimize', help='run cache, prefill and MTP gates before serving')
     ap.add_argument('--diagnose', help='run isolated teacher-forced diagnostics and exit without serving')
     args = ap.parse_args()
+    active_tokens = args.context * args.sessions
+    if args.cache_tokens is not None and args.cache_tokens < active_tokens:
+        ap.error('--cache-tokens must cover all active session slots')
     for k, v in json.loads(Path(args.env).read_text()).items():
         if k not in ('EXL3_ROOT', 'EXL3_VENV', 'EXL3_ROCM_SDK'): os.environ[k] = v
+    retained_budget = None if args.cache_tokens is None else args.cache_tokens - active_tokens
+    if retained_budget and os.environ.get('DS41_CLUSTER_PREFIX','0') != '1':
+        ap.error('retained cache tokens require prefix caching')
     p = Path(args.token_file); stat = p.stat()
     if stat.st_uid != os.getuid() or stat.st_mode & 0o077: ap.error('worker token must be private/user-owned')
     token = bytes.fromhex(p.read_text().strip())
@@ -155,7 +165,8 @@ def main():
     from .ds41_prefix import PrefixPool
     from .round_policy import RoundPolicy
     mark = lambda text: int(tokenizer.encode(text,add_bos=False,encode_special_tokens=True).flatten()[0])
-    pool = PrefixPool(pipe,user_id=mark('<｜User｜>'),assistant_id=mark('<｜Assistant｜>')) if os.environ.get('DS41_CLUSTER_PREFIX','0')=='1' else None
+    pool = PrefixPool(pipe,user_id=mark('<｜User｜>'),assistant_id=mark('<｜Assistant｜>'),
+                      token_budget=retained_budget) if os.environ.get('DS41_CLUSTER_PREFIX','0')=='1' else None
     factory = (lambda:RoundPolicy(pipe.depth)) if os.environ.get('DS41_CLUSTER_ADAPTIVE','0')=='1' else None
     Core = GreedyEngine
     if os.environ.get('DS41_CLUSTER_PREFILL_PIPELINE','0') == '1':

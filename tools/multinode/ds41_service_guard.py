@@ -13,7 +13,7 @@ import time
 
 ap = argparse.ArgumentParser()
 ap.add_argument('role', choices=('worker', 'coordinator'))
-ap.add_argument('--context', type=int, default=262144)
+ap.add_argument('--context', type=int, help='Override profile context per session')
 ap.add_argument('--depth', type=int, default=5, choices=range(1,6))
 ap.add_argument('--qualify', action='store_true')
 ap.add_argument('--optimize',action='store_true')
@@ -34,6 +34,11 @@ model = '/home/razeth/models/deepseek41-flash-1017-exl3-2.68-608c237'
 if host == 'llama2':
     assert subprocess.run(['systemctl','--user','is-active','--quiet','kyojin-glm-cluster-worker.service']).returncode != 0
 profile = json.loads((root/'profiles/ds41-268-cluster.json').read_text())
+context_override = args.context is not None
+if args.context is None: args.context = int(profile.get('context_per_session',262144))
+total_cache_tokens = args.context*2 if context_override else int(profile.get('cache_tokens',args.context*2))
+assert args.context >= 256 and args.context % 256 == 0
+assert total_cache_tokens >= args.context*2
 minimum_free = int(float(profile.get('minimum_free_gib',4))*1024**3)
 assert 2*1024**3 <= minimum_free <= 32*1024**3
 sys.path.insert(0,str(root))
@@ -56,6 +61,7 @@ if args.role == 'worker':
 else:
     command = ['.venv/bin/python','-m','tools.multinode.serve_ds41',*base,
         '--env',str(envpath),'--context',str(args.context),'--sessions','2','--depth',str(args.depth),
+        '--cache-tokens',str(total_cache_tokens),
         '--chunk',str(profile.get('prefill_chunk',256)),'--max-rows',str(profile.get('max_prefill_rows',256)),'--host','0.0.0.0','--port','8731','--model-id','deepseek-v4.1-flash-1017-2.68bpw']
 if args.qualify and args.role == 'coordinator': command += ['--qualify',str(state)]
 elif args.role == 'coordinator' and 'requested_draft_depth' in profile:
@@ -95,7 +101,8 @@ with logpath.open('x') as log, logpath.with_suffix('.memory.jsonl').open('x',buf
         minimum = min(minimum,available)
         ready = ready or 'cluster_ready' in logpath.read_text(errors='replace') or '"listening"' in logpath.read_text(errors='replace')
         report = dict(role=args.role,pid=process.pid,context=args.context,sessions=2,
-            cache_tokens=args.context*2,ready=ready,elapsed_seconds=time.monotonic()-start,
+            cache_tokens=total_cache_tokens,active_cache_tokens=args.context*2,
+            retained_cache_tokens=total_cache_tokens-args.context*2,ready=ready,elapsed_seconds=time.monotonic()-start,
             minimum_available_bytes=minimum,available_bytes=available,
             swap_used_bytes=fields.get('SwapTotal',0)-fields.get('SwapFree',0),log=str(logpath))
         (state/f'{args.role}-status.json').write_text(json.dumps(report)+'\n')

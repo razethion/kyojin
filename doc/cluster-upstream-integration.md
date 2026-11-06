@@ -185,13 +185,21 @@ two active sessions and memory behavior using the selected deployment options.
 ## 1.8.11 integration validation
 
 Both hosts ran the same integrated source fingerprint
-`ad26e768f84db3ae734963cc6045e90712b6d2ab57ffe240f269dd9f9ea0fc54`
+`1aa527d64f45643bf378932a454405835c0adc6204d7b68628ce369f28557966`
 and rebuilt native-extension SHA-256
 `8bf2e0907212a829d4aae744c2a10f7736edabf93b9d514edea4effb39e0e7b8`.
 Python, dependency versions, service units and virtual environments were
 unchanged from their backups. All three saved profiles and existing environment
 values were retained; graph policy was made explicit with `EXL3_HIP_GRAPH=0`
 and `EXL3_BLOCK_GRAPH_MAX_Q=1`.
+
+The final file audit verified all 1,938 tracked files and executable modes on
+both hosts against the published Git tree. It caught Windows archive newline
+conversion in the initial deployment; normalizing those files to the exact Git
+bytes changed the source fingerprint from `ad26e768...` to the value above.
+Native bytes and inference settings were unchanged. After restarting with the
+canonical source, the HTTP output, MTP counts, prefix reuse, concurrent-session,
+cancellation and seeded-sampling checks passed again.
 
 Validation passed:
 
@@ -209,17 +217,23 @@ Validation passed:
 
 The bounded before/after check measured:
 
-| Workload | Before | Integrated 1.8.11 |
-| --- | ---: | ---: |
-| Coding generation | 19.82 tokens/s | 21.03 tokens/s |
-| Story generation | 10.98 tokens/s | 11.62 tokens/s |
-| Prefill, 6,416 tokens | 536.96 tokens/s | 546.56 tokens/s |
-| Repeat request reusing 6,415 tokens | 0.605 s | 0.581 s |
+| Workload | Before | Initial integration | Canonical-source restart |
+| --- | ---: | ---: | ---: |
+| Coding generation | 19.82 tokens/s | 21.03 tokens/s | 18.31 tokens/s |
+| Story generation | 10.98 tokens/s | 11.62 tokens/s | 10.99 tokens/s |
+| Prefill, 6,416 tokens | 536.96 tokens/s | 546.56 tokens/s | 513.25 tokens/s |
+| Repeat request reusing 6,415 tokens | 0.605 s | 0.581 s | 0.713 s |
 
-These are single-pass regression measurements, not a stable speedup estimate
+These are short regression measurements, not a stable speedup estimate
 or a general response-quality benchmark. The candidate's first request also
 incurred cold/JIT startup: prefill took 13.44 seconds versus 0.70 seconds for
-the baseline. Warm measurements do not remove that startup cost.
+the baseline; the canonical-source restart incurred 3.46 seconds. Warm
+measurements do not remove that startup cost.
+
+A subsequent warm repeat on canonical source measured 20.10 tokens/s for the
+coding prompt and 11.00 tokens/s for the story prompt, again with exact saved
+outputs and MTP counts. That is consistent with the saved baseline rather than
+evidence for a substantial generation-speed change.
 
 The managed DeepSeek service retained two 262,144-token session slots, 524,288
 aggregate cache tokens, requested MTP depth 3 with capacity 5, and the 2 GiB
